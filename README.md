@@ -14,8 +14,10 @@ This package is under construction. The scaffold builds, and a consumer can
 import both modules. The `amqp` module encodes and decodes the AMQP 1.0
 primitive types through `amqp.Value`, `amqp.encode`, and `amqp.decode`. It also
 encodes and decodes the performatives, the delivery states, and the message
-sections through `amqp.performatives` and `amqp.message`. The client API does
-not exist yet. Do not use this package in production until version 1.0.0.
+sections through `amqp.performatives` and `amqp.message`. It reads and writes
+AMQP and SASL frames, and it exchanges the protocol headers, through
+`amqp.framing`. The client API does not exist yet. Do not use this package in
+production until version 1.0.0.
 
 Track the work in [issue #1](https://github.com/j7nw4r/eventhubs-zig/issues/1).
 Read [`docs/design.md`](docs/design.md) for the full design.
