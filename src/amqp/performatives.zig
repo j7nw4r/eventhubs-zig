@@ -16,9 +16,16 @@
 //!
 //! Each field of each type is an optional, and `null` means that the field is
 //! absent from the encoding. The specification marks some fields mandatory, and
-//! the doc comment of each such field says so. The encoder does not enforce the
-//! mandatory rule, because the decoder must accept a list that is shorter than
-//! the field count. Set the mandatory fields before you send.
+//! the doc comment of each such field says so.
+//!
+//! The decoder must accept a list that is shorter than the field count, so a
+//! mandatory field must be able to hold `null`. This module therefore applies
+//! no mandatory rule, on the encoder or on the decoder. Set the mandatory
+//! fields before you send.
+//!
+//! The rule belongs to the layer above. A peer that omits a mandatory field
+//! commits a protocol error, and the answer is an AMQP error with the correct
+//! condition, which this module cannot select.
 //!
 //! A field that is absent takes the default value that the specification gives
 //! for it. The doc comments give the defaults. This module does not apply a
