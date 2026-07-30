@@ -17,6 +17,12 @@ pub const types = @import("types.zig");
 /// The primitive type codec: `encode`, `decode`, and `Decoder`.
 pub const codec = @import("codec.zig");
 
+/// The performatives and the described types that they carry.
+pub const performatives = @import("performatives.zig");
+
+/// The message format: `Message`, `Header`, `Properties`, and the sections.
+pub const message = @import("message.zig");
+
 /// One AMQP 1.0 value. The decoder allocates it, and `Value.deinit` frees it.
 pub const Value = types.Value;
 
@@ -52,6 +58,18 @@ pub const EncodeError = codec.EncodeError;
 /// The errors that `decode` and `Decoder.next` return.
 pub const DecodeError = codec.DecodeError;
 
+/// One AMQP symbol field of a composite type.
+pub const Symbol = performatives.Symbol;
+
+/// One AMQP binary field of a composite type.
+pub const Binary = performatives.Binary;
+
+/// A decoded composite and the memory that holds it.
+pub const Decoded = performatives.Decoded;
+
+/// One AMQP 1.0 message of format 0.
+pub const Message = message.Message;
+
 /// The version of the AMQP specification that this library speaks.
 pub const protocol_version = "1.0";
 
@@ -63,4 +81,6 @@ test {
     std.testing.refAllDecls(@This());
     _ = types;
     _ = codec;
+    _ = performatives;
+    _ = message;
 }
