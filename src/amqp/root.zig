@@ -30,6 +30,10 @@ pub const framing = @import("framing.zig");
 /// The transport: TCP, TLS, the SASL dialog, and the protocol header exchange.
 pub const transport = @import("transport.zig");
 
+/// The connection: the open negotiation, the frame demultiplexer, the
+/// heartbeat, and the close handshake.
+pub const connection = @import("connection.zig");
+
 /// One AMQP 1.0 value. The decoder allocates it, and `Value.deinit` frees it.
 pub const Value = types.Value;
 
@@ -138,6 +142,24 @@ pub const ConnectError = transport.ConnectError;
 /// The errors of the SASL dialog and the protocol header exchange.
 pub const HandshakeError = transport.HandshakeError;
 
+/// One AMQP 1.0 connection: the tasks, the locks, and the negotiated limits.
+pub const Connection = connection.Connection;
+
+/// The read side and the write side of one connected byte stream.
+pub const Stream = connection.Stream;
+
+/// The arguments of `Connection.open` that the open frame carries.
+pub const ConnectionOptions = connection.Options;
+
+/// The queue that receives the frames of one channel.
+pub const FrameQueue = connection.FrameQueue;
+
+/// The reason that a connection ended, with the text that came with it.
+pub const Failure = connection.Failure;
+
+/// The reasons that a connection ends.
+pub const ConnectionError = connection.Error;
+
 /// The version of the AMQP specification that this library speaks.
 pub const protocol_version = "1.0";
 
@@ -153,4 +175,5 @@ test {
     _ = message;
     _ = framing;
     _ = transport;
+    _ = connection;
 }
