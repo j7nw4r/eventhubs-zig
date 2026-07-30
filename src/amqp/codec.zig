@@ -58,7 +58,12 @@ pub const max_depth: usize = 64;
 /// input can hold many such arrays. `elementBudget` bounds the whole decode.
 pub const max_zero_width_elements: usize = 1 << 13;
 
-/// The number of values that one decode of `input_len` octets may allocate.
+/// The number of child values that one decode of `input_len` octets may
+/// allocate for a list, a map, and an array.
+///
+/// A described value allocates two cells that this budget does not count.
+/// That path needs no budget, because every described value costs at least the
+/// one octet of its `00` constructor, so it is linear in the input length.
 ///
 /// Every value of a legal encoding costs at least one octet, with one
 /// exception: an array whose element constructor has a width of zero holds
@@ -798,7 +803,7 @@ pub const Decoder = struct {
             items.deinit(gpa);
         }
         try d.spend(count);
-        try items.ensureTotalCapacity(gpa, count);
+        try items.ensureTotalCapacityPrecise(gpa, count);
 
         d.depth += 1;
         defer d.depth -= 1;
@@ -827,7 +832,7 @@ pub const Decoder = struct {
             entries.deinit(gpa);
         }
         try d.spend(count);
-        try entries.ensureTotalCapacity(gpa, count / 2);
+        try entries.ensureTotalCapacityPrecise(gpa, count / 2);
 
         d.depth += 1;
         defer d.depth -= 1;
@@ -886,7 +891,7 @@ pub const Decoder = struct {
             items.deinit(gpa);
         }
         try d.spend(count);
-        try items.ensureTotalCapacity(gpa, count);
+        try items.ensureTotalCapacityPrecise(gpa, count);
 
         for (0..count) |_| items.appendAssumeCapacity(try d.decodeBody(gpa, code));
 
