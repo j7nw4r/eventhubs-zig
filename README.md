@@ -10,9 +10,9 @@ Two Zig libraries in one package.
 
 ## Status
 
-This package is under construction. The scaffold builds and both modules are
-importable, but the client API is not written yet. Do not use it in production
-until version 1.0.0.
+This package is under construction. The scaffold builds, and a consumer can
+import both modules. The client API does not exist yet. Do not use this package
+in production until version 1.0.0.
 
 Track the work in [issue #1](https://github.com/j7nw4r/eventhubs-zig/issues/1).
 Read [`docs/design.md`](docs/design.md) for the full design.

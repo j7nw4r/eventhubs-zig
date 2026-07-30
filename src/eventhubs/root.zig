@@ -7,8 +7,8 @@
 
 const std = @import("std");
 
-/// The AMQP 1.0 client library that this SDK is built on. It is re-exported
-/// so that a caller can reach the message types through one dependency.
+/// The AMQP 1.0 client library that this SDK builds on. This module re-exports
+/// it, so that a caller can reach the message types through one dependency.
 pub const amqp = @import("amqp");
 
 test "the amqp module is wired in" {

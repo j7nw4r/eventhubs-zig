@@ -33,7 +33,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(amqp_tests).step);
     test_step.dependOn(&b.addRunArtifact(eventhubs_tests).step);
 
-    // zig build fmt: the format check that CI runs.
+    // zig build fmt: the format check that CI runs. Add each new top-level
+    // source directory to this list, or its files escape the check.
     const fmt_check = b.addFmt(.{
         .paths = &.{ "build.zig", "build.zig.zon", "src" },
         .check = true,
