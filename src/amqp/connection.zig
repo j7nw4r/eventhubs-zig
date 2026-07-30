@@ -557,6 +557,21 @@ pub const Connection = struct {
         queue.value.close(self.io);
     }
 
+    /// Points `channel` at a queue that a session already registered under its
+    /// own channel number.
+    ///
+    /// Section 2.5.1 gives a session two channel numbers: the one that this
+    /// peer sends on, and the one that the remote peer sends on. The two are
+    /// independent. This function adds the second one, so both reach one queue.
+    ///
+    /// Only the demultiplexer task calls this, so no frame on the new channel
+    /// can arrive before the bind finishes.
+    fn bindChannel(self: *Connection, channel: u16, queue: *FrameQueue) Allocator.Error!void {
+        self.channels_mutex.lockUncancelable(self.io);
+        defer self.channels_mutex.unlock(self.io);
+        try self.channels.put(self.gpa, channel, queue);
+    }
+
     /// Returns the queue of `channel`, or null when no session registered one.
     fn lookupChannel(self: *Connection, channel: u16) ?*FrameQueue {
         self.channels_mutex.lockUncancelable(self.io);
@@ -759,7 +774,26 @@ pub const Connection = struct {
             else => {},
         }
 
-        const queue = self.lookupChannel(owned.channel) orelse {
+        const queue = self.lookupChannel(owned.channel) orelse bind: {
+            // Section 2.5.1: a peer answers a begin on a channel of its own
+            // choosing, and it names the channel of this peer in the
+            // `remote-channel` field. The two numbers are independent, so the
+            // answer usually arrives on a channel that no session registered.
+            //
+            // The bind happens in this task, and not in the session, because a
+            // later frame on the new channel would otherwise race the bind.
+            if (body == .begin) {
+                if (body.begin.remote_channel) |local| {
+                    if (self.lookupChannel(local)) |q| {
+                        self.bindChannel(owned.channel, q) catch {
+                            owned.deinit();
+                            self.fail(error.TransportFailure, null, "the channel table ran out of memory");
+                            return .stop;
+                        };
+                        break :bind q;
+                    }
+                }
+            }
             owned.deinit();
             self.fail(
                 error.ProtocolError,

@@ -95,6 +95,13 @@ const Symbol = performatives.Symbol;
 // -------------------------------------------------------------------------
 
 /// The incoming window that `Options` asks for, in transfer frames.
+/// The distance at which an RFC 1982 serial difference counts as negative.
+///
+/// Section 2.5.6 applies RFC 1982 serial number arithmetic to the transfer
+/// ids and the windows, so a difference of this size or more means that the
+/// value is behind, and not far ahead.
+const serial_negative: u32 = 1 << 31;
+
 pub const default_incoming_window: u32 = 5000;
 
 /// The outgoing window that `Options` advertises, in transfer frames.
@@ -245,6 +252,9 @@ pub const Window = struct {
         /// advertised. Section 2.8.17 names the condition
         /// `amqp:session:window-violation`.
         WindowViolation,
+        /// The peer omitted a field that the specification makes mandatory.
+        /// Section 2.7.4 marks `incoming-window` mandatory on a flow frame.
+        MissingField,
     };
 
     /// Returns the state of a session that has sent no frame yet.
@@ -312,13 +322,28 @@ pub const Window = struct {
     /// next-incoming-id and the incoming-window of the frame, and it falls back
     /// to the initial outgoing id of this endpoint when the frame carries no
     /// next-incoming-id.
-    pub fn receiveFlow(self: *Window, flow: performatives.Flow) void {
+    pub fn receiveFlow(self: *Window, flow: performatives.Flow) ReceiveError!void {
         if (flow.next_outgoing_id) |id| self.next_incoming_id = id;
         if (flow.outgoing_window) |window| self.remote_outgoing_window = window;
 
-        const incoming_window = flow.incoming_window orelse 0;
+        const incoming_window = flow.incoming_window orelse return error.MissingField;
         const base = flow.next_incoming_id orelse self.initial_outgoing_id;
-        self.remote_incoming_window = base +% incoming_window -% self.next_outgoing_id;
+
+        // The three values are serial numbers of section 2.5.6, which applies
+        // RFC 1982 arithmetic, so the sum and the difference both wrap.
+        //
+        // A peer may hold fewer transfers than this endpoint already sent. It
+        // shrinks its window, or its flow carries a view that is older than the
+        // transfers in flight. The difference is then negative, and a plain
+        // wrapping subtraction turns it into a number near 2^32. This endpoint
+        // would read that as room for four billion transfers and flood the
+        // peer, and the peer would end the session for a window violation.
+        //
+        // RFC 1982 reads a difference at or above 2^31 as negative, so the
+        // window is zero in that case.
+        const limit = base +% incoming_window;
+        const distance = limit -% self.next_outgoing_id;
+        self.remote_incoming_window = if (distance >= serial_negative) 0 else distance;
     }
 
     /// Accounts for one outgoing transfer frame.
@@ -495,7 +520,9 @@ pub const Session = struct {
     /// The outgoing channel number of this endpoint.
     channel: u16,
     /// The channel that the begin frame of the remote peer named.
-    remote_channel: u16,
+    /// The channel that the remote peer sends on, or null until its begin
+    /// arrives. Section 2.5.1 makes it independent of `channel`.
+    remote_channel: ?u16,
 
     /// The lock that guards `window` and `end_sent`.
     state_mutex: Io.Mutex,
@@ -578,7 +605,7 @@ pub const Session = struct {
             .connection = connection,
             .queue = &storage.queue,
             .channel = 0,
-            .remote_channel = 0,
+            .remote_channel = null,
             .state_mutex = .init,
             .window = .init(options),
             .end_sent = false,
@@ -655,6 +682,19 @@ pub const Session = struct {
     /// send but cannot receive, so any other performative before the begin
     /// breaks the protocol. Section 2.5.3 still lets the remote peer answer
     /// with an end, and this call reports that as a failure.
+    /// Gives back every channel that this session holds.
+    ///
+    /// Section 2.5.1 gives a session two channel numbers, and the connection
+    /// holds a table entry for each one once the begin of the remote peer
+    /// arrives. Both must go, or the demultiplexer keeps routing frames to a
+    /// queue that this session already closed.
+    fn releaseChannels(self: *Session) void {
+        self.connection.unregisterChannel(self.channel);
+        if (self.remote_channel) |remote| {
+            if (remote != self.channel) self.connection.unregisterChannel(remote);
+        }
+    }
+
     fn readRemoteBegin(self: *Session) BeginError!void {
         while (true) {
             var frame = self.queue.getOne(self.io) catch |err| switch (err) {
@@ -691,7 +731,7 @@ pub const Session = struct {
                     // is free again.
                     self.sendEndUncancelable(null) catch {};
                     self.remote_end_seen.store(true, .release);
-                    self.connection.unregisterChannel(self.channel);
+                    self.releaseChannels();
                     if (remote.error_condition == null) return error.SessionEnded;
                     return error.SessionRemoteError;
                 },
@@ -732,7 +772,7 @@ pub const Session = struct {
         // channel that no session registered.
         if (self.remote_end_seen.load(.acquire) and !self.unregistered) {
             self.unregistered = true;
-            self.connection.unregisterChannel(self.channel);
+            self.releaseChannels();
         }
 
         drainQueue(self.io, self.queue);
@@ -920,6 +960,9 @@ pub const Session = struct {
         defer self.state_mutex.unlock(self.io);
 
         if (self.failure()) |f| return f.err;
+        // Section 2.5.5: after this endpoint sends its end frame the session
+        // is in END-SENT, and no further frame of the session may follow it.
+        if (self.end_sent) return error.SessionEnded;
         if (!self.window.canSendTransfer()) return error.RemoteWindowClosed;
 
         try self.connection.send(self.channel, .{ .transfer = performative }, payload);
@@ -938,6 +981,9 @@ pub const Session = struct {
         defer self.state_mutex.unlock(self.io);
 
         if (self.failure()) |f| return f.err;
+        // Section 2.5.5: after this endpoint sends its end frame the session
+        // is in END-SENT, and no further frame of the session may follow it.
+        if (self.end_sent) return error.SessionEnded;
         return self.connection.send(self.channel, .{ .flow = self.flowBody(link) }, "");
     }
 
@@ -1043,7 +1089,7 @@ pub const Session = struct {
         // peer arrived.
         if (self.remote_end_seen.load(.acquire) and !self.unregistered) {
             self.unregistered = true;
-            self.connection.unregisterChannel(self.channel);
+            self.releaseChannels();
         }
 
         if (timed_out) return error.Timeout;
@@ -1262,7 +1308,16 @@ pub const Session = struct {
             };
             defer self.state_mutex.unlock(self.io);
 
-            self.window.receiveFlow(performative);
+            // Section 2.7.4 makes `incoming-window` mandatory on a flow, so a
+            // frame without it is a protocol error and not a zero window.
+            self.window.receiveFlow(performative) catch {
+                self.state_mutex.unlock(self.io);
+                owned.deinit();
+                return self.endWithError(
+                    condition.not_allowed,
+                    "a flow frame carried no incoming window",
+                );
+            };
 
             // Section 2.7.4: "If set to true then the receiver SHOULD send its
             // state at the earliest convenient opportunity." A flow that names
@@ -1955,13 +2010,55 @@ test "the transfer ids wrap with serial arithmetic" {
     try testing.expectEqual(@as(u32, 0), window.next_incoming_id);
 }
 
+test "a flow that shrinks the window below the frames in flight gives no room" {
+    var window: Window = .init(.{
+        .incoming_window = 5000,
+        .outgoing_window = 5000,
+        .initial_outgoing_id = 100,
+    });
+
+    // This endpoint sent ten transfers, so its next outgoing id is 110. The
+    // peer then shrinks its window and allows ids up to 104 only. Section
+    // 2.5.6 applies RFC 1982 arithmetic, so the difference is negative and the
+    // window is zero. A plain wrapping subtraction gives 4294967291 instead,
+    // and this endpoint would flood the peer.
+    for (0..10) |_| window.sendTransfer();
+    try testing.expectEqual(@as(u32, 110), window.next_outgoing_id);
+
+    try window.receiveFlow(.{
+        .next_incoming_id = 100,
+        .incoming_window = 5,
+        .next_outgoing_id = 0,
+        .outgoing_window = 5000,
+    });
+
+    try testing.expectEqual(@as(u32, 0), window.remote_incoming_window);
+    try testing.expect(!window.canSendTransfer());
+}
+
+test "a flow without an incoming window is a protocol error" {
+    var window: Window = .init(.{
+        .incoming_window = 5000,
+        .outgoing_window = 5000,
+        .initial_outgoing_id = 0,
+    });
+
+    // Section 2.7.4 makes the field mandatory, so a frame without it is a
+    // protocol error and not a window of zero.
+    try testing.expectError(error.MissingField, window.receiveFlow(.{
+        .next_incoming_id = 0,
+        .next_outgoing_id = 0,
+        .outgoing_window = 5000,
+    }));
+}
+
 test "a flow recomputes the remote incoming window from its own fields" {
     var window: Window = .init(.{});
     window.next_outgoing_id = 10;
 
     // Section 2.5.6: next-incoming-id(flow) + incoming-window(flow)
     // - next-outgoing-id(endpoint).
-    window.receiveFlow(.{
+    try window.receiveFlow(.{
         .next_incoming_id = 8,
         .incoming_window = 5,
         .next_outgoing_id = 3,
@@ -1978,7 +2075,7 @@ test "a flow without a next incoming id uses the initial outgoing id" {
 
     // Section 2.5.6: initial-outgoing-id(endpoint) + incoming-window(flow)
     // - next-outgoing-id(endpoint).
-    window.receiveFlow(.{
+    try window.receiveFlow(.{
         .incoming_window = 20,
         .next_outgoing_id = 4,
         .outgoing_window = 4,
@@ -2029,6 +2126,52 @@ test "the session flow carries the four mandatory fields and no link field" {
 // The tests of the handshakes
 // -------------------------------------------------------------------------
 
+test "the peer answers the begin on a channel of its own choosing" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: Storage = try .init(gpa, default_incoming_window);
+    defer storage.deinit(gpa);
+
+    // Section 2.5.1: the peer allocates an unused outgoing channel of its own
+    // and names this peer's channel in `remote-channel`. The two numbers are
+    // independent, so the answer arrives on channel 7 while this peer sent its
+    // begin on channel 0. A later frame also arrives on channel 7.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const gate_at = sink.written().len;
+    try appendFrame(&sink, 7, remoteBegin(0), "");
+    try appendFrame(&sink, 7, .{ .flow = .{
+        .next_incoming_id = 0,
+        .incoming_window = 50,
+        .next_outgoing_id = 0,
+        .outgoing_window = 60,
+    } }, "");
+
+    var gates = [_]Gate{.{ .at = gate_at, .after_frames = 2 }};
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{});
+    defer session.deinit();
+
+    try testing.expectEqual(@as(u16, 0), session.channel);
+    try testing.expectEqual(@as(?u16, 7), session.remote_channel);
+
+    // The frame that follows on the channel of the peer must reach this
+    // session, and must not end the connection as an unregistered channel.
+    var frame = try session.queue.getOne(io);
+    frame.deinit();
+    try testing.expect(connection.failure() == null);
+}
+
 test "begin sends one begin frame and records the state of the remote peer" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -2058,7 +2201,7 @@ test "begin sends one begin frame and records the state of the remote peer" {
     defer session.deinit();
 
     try testing.expectEqual(@as(u16, 0), session.channel);
-    try testing.expectEqual(@as(u16, 0), session.remote_channel);
+    try testing.expectEqual(@as(?u16, 0), session.remote_channel);
     try testing.expectEqual(@as(u32, 0), session.window.next_incoming_id);
     try testing.expectEqual(@as(u32, 100), session.window.remote_incoming_window);
     try testing.expectEqual(@as(u32, 200), session.window.remote_outgoing_window);
