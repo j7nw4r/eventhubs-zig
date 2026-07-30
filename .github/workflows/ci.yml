@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      # Actions are pinned to a commit, because a later workflow gives this
+      # repository a live Event Hubs connection string as a secret.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          # Keep this in step with .minimum_zig_version in build.zig.zon.
+          version: 0.16.0
+
+      - name: Check the formatting
+        run: zig build fmt
+
+      - name: Check the layer purity
+        run: zig build purity
+
+      - name: Run the unit tests
+        run: zig build test --summary all
