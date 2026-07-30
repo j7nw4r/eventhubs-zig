@@ -52,7 +52,19 @@
 //! A session gives the memory of its queue to `registerChannel`, and that
 //! memory must stay valid until `Connection.deinit` returns. The connection
 //! closes every registered queue when it ends, so a blocked reader wakes with
-//! `error.Closed` and then reads `failure` for the reason.
+//! `error.Closed`.
+//!
+//! **Every queue reader must return before `deinit` starts, and a reader that
+//! woke with `error.Closed` must not touch the connection after that.**
+//! `deinit` frees the connection, and it holds no lock against a reader that a
+//! closed queue just woke. A reader that calls `failure` in that window reads
+//! freed memory.
+//!
+//! The safe order for an owner of a reader task is: end the reader task, await
+//! it, and then call `deinit`. A reader that wants the reason must read
+//! `failure` while the connection is alive, which the owner guarantees by that
+//! order. `close` is the call that ends a connection and leaves it readable;
+//! `deinit` is the call that frees it.
 //!
 //! A queue can still hold frames after the connection ends, because `get`
 //! gives the buffered elements before it reports `error.Closed`. The owner of
@@ -367,7 +379,15 @@ pub const Connection = struct {
         errdefer if (self.remote_container_id) |id| gpa.free(id);
 
         try self.group.concurrent(io, demultiplex, .{self});
-        errdefer self.group.cancel(io);
+        errdefer {
+            // The cancel joins the task, so nothing writes the failure fields
+            // after this point. The demultiplexer may already have ended the
+            // connection and duped the reason, and only `deinit` frees those
+            // strings, which this path never reaches.
+            self.group.cancel(io);
+            if (self.failure_condition) |text| gpa.free(text);
+            if (self.failure_description) |text| gpa.free(text);
+        }
 
         // Section 2.4.5: a peer that asks for no idle timeout needs no
         // heartbeat, and neither does a peer that asks for zero.
@@ -520,8 +540,14 @@ pub const Connection = struct {
     /// Removes the queue of `channel` and closes it.
     ///
     /// The demultiplexer can still hold the pointer, so the memory of the
-    /// queue must stay valid until `deinit` returns. A push to the closed
-    /// queue reports `error.Closed`, and the demultiplexer drops the frame.
+    /// queue must stay valid until `deinit` returns.
+    ///
+    /// The demultiplexer drops a frame only when it already holds the queue
+    /// pointer, which is the frame that races this call. The NEXT frame on the
+    /// channel finds no queue, and that ends the connection with a protocol
+    /// error. A peer legally keeps frames in flight until its `end` arrives, so
+    /// a session must call this only after it read the `end` of the remote
+    /// peer.
     pub fn unregisterChannel(self: *Connection, channel: u16) void {
         const queue = blk: {
             self.channels_mutex.lockUncancelable(self.io);
@@ -559,6 +585,10 @@ pub const Connection = struct {
 
         if (self.failure()) |f| return f.err;
         if (self.write_dead) return error.TransportFailure;
+        // Section 2.4.3: the close frame is the last thing that this peer ever
+        // writes onto the connection. A caller that races the close handshake
+        // must get an error, and not put a frame after the close frame.
+        if (self.close_sent) return error.ConnectionClosed;
         return self.writeLocked(channel, body, payload);
     }
 
@@ -574,17 +604,45 @@ pub const Connection = struct {
         try self.writer.flush();
     }
 
-    /// Sends the close frame of section 2.7.9 once.
+    /// Sends the close frame of section 2.7.9 once, from a caller task.
     ///
-    /// The lock is uncancelable, because the close handshake must still run
-    /// after a cancel request reached the task.
+    /// The lock is uncancelable, because the close handshake of the caller must
+    /// still run after a cancel request reached the task.
+    ///
+    /// The demultiplexer must NOT use this function. Read `sendCloseBestEffort`
+    /// for the reason.
     fn sendClose(
         self: *Connection,
         condition: ?performatives.ErrorCondition,
     ) framing.WriteFrameError!void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
+        return self.sendCloseLocked(condition);
+    }
 
+    /// Answers a close frame from the demultiplexer task, and gives up when the
+    /// write lock does not come free.
+    ///
+    /// The demultiplexer must never take the write lock uncancelably. Section
+    /// 2.4.3 lets a peer send its close frame and then read nothing more, so a
+    /// caller that holds the lock inside a blocked flush holds it forever. An
+    /// uncancelable wait here therefore makes `deinit` hang: `Io.Group.cancel`
+    /// joins its tasks, and a task inside an uncancelable wait never reaches a
+    /// cancellation point.
+    ///
+    /// The answer is best effort, so a lock that never comes free costs only
+    /// the answer.
+    fn sendCloseBestEffort(self: *Connection, condition: ?performatives.ErrorCondition) void {
+        self.write_mutex.lock(self.io) catch return;
+        defer self.write_mutex.unlock(self.io);
+        self.sendCloseLocked(condition) catch {};
+    }
+
+    /// Writes the close frame. The caller holds `write_mutex`.
+    fn sendCloseLocked(
+        self: *Connection,
+        condition: ?performatives.ErrorCondition,
+    ) framing.WriteFrameError!void {
         if (self.write_dead or self.close_sent) return;
         self.close_sent = true;
         return self.writeLocked(0, .{ .close = .{ .error_condition = condition } }, "");
@@ -714,8 +772,10 @@ pub const Connection = struct {
         // The payload borrows `read_buf`, and the next read overwrites it, so
         // the frame takes its own copy before it leaves this task.
         adoptPayload(&owned) catch {
+            // The memory of this process ran out. That is a local failure and
+            // not a protocol violation of the peer, so it takes its own reason.
             owned.deinit();
-            self.fail(error.ProtocolError, null, @errorName(error.OutOfMemory));
+            self.fail(error.TransportFailure, null, "the connection ran out of memory for a frame");
             return .stop;
         };
 
@@ -733,8 +793,11 @@ pub const Connection = struct {
 
     /// Answers the close frame of the remote peer and ends the connection.
     fn handleRemoteClose(self: *Connection, performative: performatives.Close) void {
-        // Section 2.4.3: a peer answers a close frame with a close frame.
-        self.sendClose(null) catch {};
+        // Section 2.4.3: a peer answers a close frame with a close frame. This
+        // task must not wait for the write lock without a way out, because a
+        // caller inside a blocked flush holds it and the peer that just sent
+        // its close frame may read nothing more.
+        self.sendCloseBestEffort(null);
 
         const condition_error = performative.error_condition orelse {
             self.fail(error.ConnectionClosed, null, null);
@@ -1039,12 +1102,19 @@ const QueueReader = struct {
     received: u32 = 0,
     /// The reason that the queue gave, or null while the task still reads.
     woke_with: ?Error = null,
+    /// Whether the task may read `Connection.failure` after the queue wakes it.
+    ///
+    /// A test that frees the connection before it awaits this task must set
+    /// this to false. `deinit` frees the connection and holds no lock against a
+    /// reader that a closed queue just woke, so a read in that window reads
+    /// freed memory.
+    consult_connection: bool = true,
 
     fn run(self: *QueueReader) void {
         while (true) {
             var frame = self.queue.getOne(self.io) catch {
-                self.woke_with = if (self.connection.failure()) |f|
-                    f.err
+                self.woke_with = if (self.consult_connection)
+                    if (self.connection.failure()) |f| f.err else error.ConnectionClosed
                 else
                     error.ConnectionClosed;
                 return;
@@ -1158,6 +1228,65 @@ test "the close handshake sends one close frame and ends the connection" {
     } }, "", framing.min_max_frame_size);
     try framing.writeFrame(&want.writer, 0, .{ .close = .{} }, "", default_max_frame_size);
     try testing.expectEqualSlices(u8, want.written(), peer.sent());
+}
+
+/// Runs `Connection.close` in its own task, so a test can act during the
+/// close handshake.
+const Closer = struct {
+    connection: *Connection,
+    io: Io,
+    result: ?anyerror = null,
+
+    fn run(self: *Closer) void {
+        self.connection.close(null) catch |err| {
+            self.result = err;
+        };
+    }
+};
+
+test "a send during the close handshake is refused before the peer answers" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    // The peer sends its open frame and then answers nothing, so the close
+    // handshake stays open and `failure` stays null while `close_sent` is true.
+    // That window is the one that section 2.4.3 governs.
+    const script = try scriptOpen(gpa, .{ .container_id = "the-peer" });
+    defer gpa.free(script);
+
+    var peer: Peer = .init(gpa, io, script, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    var wrote_close: Io.Event = .unset;
+    peer.counter.release = &wrote_close;
+    peer.counter.release_after = 2;
+
+    const connection = try Connection.open(gpa, io, stream, .{
+        .container_id = "the-client",
+        .close_timeout = .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } },
+    });
+    defer connection.deinit();
+
+    var closer: Closer = .{ .connection = connection, .io = io };
+    var task = io.concurrent(Closer.run, .{&closer}) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+
+    // The open frame and the close frame are both on the wire now.
+    try wrote_close.wait(io);
+    const before = peer.sent().len;
+
+    try testing.expectError(error.ConnectionClosed, connection.send(
+        1,
+        .{ .flow = .{ .incoming_window = 1, .next_outgoing_id = 0, .outgoing_window = 1 } },
+        "",
+    ));
+    try testing.expectEqual(before, peer.sent().len);
+
+    task.await(io);
 }
 
 test "the connection sends a heartbeat under a scripted remote idle timeout" {
@@ -1560,7 +1689,14 @@ test "deinit wakes a reader that waits on a channel queue" {
     var queue: FrameQueue = .init(&empty);
     try connection.registerChannel(1, &queue);
 
-    var reader: QueueReader = .{ .connection = connection, .queue = &queue, .io = io };
+    // This test frees the connection before it awaits the reader, so the
+    // reader must not read the connection after the queue wakes it.
+    var reader: QueueReader = .{
+        .connection = connection,
+        .queue = &queue,
+        .io = io,
+        .consult_connection = false,
+    };
     var task = io.concurrent(QueueReader.run, .{&reader}) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
             connection.deinit();
