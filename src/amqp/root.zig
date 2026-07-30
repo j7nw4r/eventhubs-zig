@@ -34,6 +34,10 @@ pub const transport = @import("transport.zig");
 /// heartbeat, and the close handshake.
 pub const connection = @import("connection.zig");
 
+/// The session: the begin handshake, the window of section 2.5.6, the routing
+/// of the link frames by handle, and the end handshake.
+pub const session = @import("session.zig");
+
 /// One AMQP 1.0 value. The decoder allocates it, and `Value.deinit` frees it.
 pub const Value = types.Value;
 
@@ -160,6 +164,30 @@ pub const Failure = connection.Failure;
 /// The reasons that a connection ends.
 pub const ConnectionError = connection.Error;
 
+/// One AMQP 1.0 session: one channel, one window, and the links that it holds.
+pub const Session = session.Session;
+
+/// The arguments of `Session.begin`.
+pub const SessionOptions = session.Options;
+
+/// The channel queue of one session, and the memory that holds it.
+pub const SessionStorage = session.Storage;
+
+/// The reason that a session ended, with the text that came with it.
+pub const SessionFailure = session.Failure;
+
+/// The reasons that a session ends.
+pub const SessionError = session.Error;
+
+/// The flow control state of one session endpoint. Section 2.5.6.
+pub const Window = session.Window;
+
+/// The link fields of a flow frame.
+pub const LinkFlow = session.LinkFlow;
+
+/// The error condition symbols that the session layer sends.
+pub const session_condition = session.condition;
+
 /// The version of the AMQP specification that this library speaks.
 pub const protocol_version = "1.0";
 
@@ -176,4 +204,5 @@ test {
     _ = framing;
     _ = transport;
     _ = connection;
+    _ = session;
 }
