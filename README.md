@@ -11,8 +11,10 @@ Two Zig libraries in one package.
 ## Status
 
 This package is under construction. The scaffold builds, and a consumer can
-import both modules. The client API does not exist yet. Do not use this package
-in production until version 1.0.0.
+import both modules. The `amqp` module encodes and decodes the AMQP 1.0
+primitive types through `amqp.Value`, `amqp.encode`, and `amqp.decode`. The
+client API does not exist yet. Do not use this package in production until
+version 1.0.0.
 
 Track the work in [issue #1](https://github.com/j7nw4r/eventhubs-zig/issues/1).
 Read [`docs/design.md`](docs/design.md) for the full design.
@@ -20,7 +22,7 @@ Read [`docs/design.md`](docs/design.md) for the full design.
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 | Bootstrap: the two modules, the test steps, and CI | Complete |
-| M1 | AMQP 1.0 core: codec, framing, transport, connection, session, links, interoperability tier | Not started |
+| M1 | AMQP 1.0 core: codec, framing, transport, connection, session, links, interoperability tier | In progress |
 | M2 | Authentication: connection strings, SAS signing, CBS token refresh | Not started |
 | M3 | Clients and live tests: producer, receiver, management, recovery, emulator tier | Not started |
 | M4 | GA: API review, samples, documentation, the 1.0.0 release | Not started |
