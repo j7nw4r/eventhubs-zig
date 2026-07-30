@@ -27,6 +27,9 @@ pub const message = @import("message.zig");
 /// headers.
 pub const framing = @import("framing.zig");
 
+/// The transport: TCP, TLS, the SASL dialog, and the protocol header exchange.
+pub const transport = @import("transport.zig");
+
 /// One AMQP 1.0 value. The decoder allocates it, and `Value.deinit` frees it.
 pub const Value = types.Value;
 
@@ -111,6 +114,30 @@ pub const WriteFrameError = framing.WriteFrameError;
 /// The errors that `readFrame` returns.
 pub const ReadFrameError = framing.ReadFrameError;
 
+/// One connected AMQP 1.0 byte stream.
+pub const Transport = transport.Transport;
+
+/// Whether the transport puts TLS below the AMQP protocol header.
+pub const TlsMode = transport.TlsMode;
+
+/// The SASL mechanism and the data that it needs.
+pub const Sasl = transport.Sasl;
+
+/// The arguments of `Transport.connect` that are neither the host nor the port.
+pub const TransportOptions = transport.Options;
+
+/// The detail of a failed handshake. It never holds a credential.
+pub const Diagnostics = transport.Diagnostics;
+
+/// Runs the SASL dialog on a reader and a writer.
+pub const performSasl = transport.performSasl;
+
+/// The errors of `Transport.connect`.
+pub const ConnectError = transport.ConnectError;
+
+/// The errors of the SASL dialog and the protocol header exchange.
+pub const HandshakeError = transport.HandshakeError;
+
 /// The version of the AMQP specification that this library speaks.
 pub const protocol_version = "1.0";
 
@@ -125,4 +152,5 @@ test {
     _ = performatives;
     _ = message;
     _ = framing;
+    _ = transport;
 }

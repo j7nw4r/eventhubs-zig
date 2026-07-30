@@ -83,6 +83,35 @@ zig build purity    # make sure the amqp module stays vendor free
 
 CI runs all three steps on `ubuntu-latest` and on `macos-latest`.
 
+### The live tests
+
+`zig build test` runs every unit test with no network. The live tests of
+`src/amqp/transport.zig` open a real connection, and each one returns
+`error.SkipZigTest` when its environment variables are absent. So a developer
+with no broker still gets a green build.
+
+The layer purity rule forbids the name of the vendor inside `src/amqp/`, so the
+variables carry neutral names:
+
+| Variable | Meaning |
+|---|---|
+| `AMQP_LIVE_HOST` | The host name of the broker, such as the fully qualified name of an Event Hubs namespace. Required. |
+| `AMQP_LIVE_PORT` | The port. The default is 5671, the AMQP over TLS port. |
+| `AMQP_LIVE_AUTHCID` | The identity of the SASL PLAIN test. |
+| `AMQP_LIVE_PASSWORD` | The secret of the SASL PLAIN test. |
+
+For an Event Hubs namespace, `AMQP_LIVE_HOST` takes the `Endpoint` host of the
+connection string, and the two PLAIN variables take `SharedAccessKeyName` and
+`SharedAccessKey`. Event Hubs itself authorizes over a token and accepts SASL
+ANONYMOUS, so the ANONYMOUS test needs `AMQP_LIVE_HOST` alone:
+
+```
+AMQP_LIVE_HOST=<namespace>.servicebus.windows.net zig build test
+```
+
+Every live test has a 30 second timeout, so a peer that never answers fails the
+test instead of stopping the suite. No test ever prints a credential.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
