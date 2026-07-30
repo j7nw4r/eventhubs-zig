@@ -18,12 +18,16 @@
 //!
 //! # The decoder
 //!
-//! `decode` reads one value from a byte slice. It checks every length against
-//! the bytes that remain, so it never reads outside the slice. It returns
-//! `error.Malformed` for a truncated input, for an unknown constructor, for
-//! text that is not valid UTF-8, and for the other rules that this file
-//! documents. The decoder allocates, and the caller frees the result with
-//! `Value.deinit`.
+//! `decode` reads one value from a byte slice. It makes sure that every length
+//! agrees with the bytes that remain. Thus it never reads outside the slice.
+//!
+//! The decoder returns `error.Malformed` for a truncated input, for an unknown
+//! constructor, and for text that is not valid UTF-8. It applies the other
+//! rules that this file documents in the same way.
+//!
+//! The decoder allocates, and the caller frees the result with `Value.deinit`.
+//! One decode also has a budget, so a short input cannot drive a large
+//! allocation. Read the note on `elementBudget`.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -44,12 +48,30 @@ const max_u32: usize = std.math.maxInt(u32);
 /// as `error.InvalidValue`.
 pub const max_depth: usize = 64;
 
-/// The largest element count that the decoder accepts for an array whose
+/// The largest element count that the decoder accepts for ONE array whose
 /// element constructor has a width of zero, such as an array of null. The
 /// encoded size of such an array does not grow with the element count, so a
 /// short input can declare a very large count. The decoder rejects a count
 /// above this limit with `error.Malformed`.
+///
+/// This limit bounds one array. It does not bound a whole decode, because an
+/// input can hold many such arrays. `elementBudget` bounds the whole decode.
 pub const max_zero_width_elements: usize = 1 << 13;
+
+/// The number of values that one decode of `input_len` octets may allocate.
+///
+/// Every value of a legal encoding costs at least one octet, with one
+/// exception: an array whose element constructor has a width of zero holds
+/// elements that cost no octets at all. So `input_len` pays for every ordinary
+/// value, and `max_zero_width_elements` pays for the zero-width elements of
+/// the whole input, not of each array.
+///
+/// Without this budget a short input reaches a large allocation. An input of
+/// 10 kB that holds a thousand arrays, each of 10 octets and each declaring
+/// 8192 null elements, allocates about 328 MB.
+fn elementBudget(input_len: usize) usize {
+    return input_len +| max_zero_width_elements;
+}
 
 /// The errors that `encode` and `encodedSize` return.
 pub const EncodeError = Writer.Error || error{
@@ -572,6 +594,11 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Value {
 }
 
 /// A cursor over a byte slice that reads one value at a time.
+///
+/// Build a decoder with `init`, and then use `next` and `atEnd` only. The
+/// fields below hold an invariant that the methods keep. Do not write them.
+/// A write puts the cursor outside the slice, and the next read then traps on
+/// an integer overflow.
 pub const Decoder = struct {
     /// The bytes that the decoder reads. A compound encoding narrows this
     /// slice while it reads its items, and restores it afterwards, so an item
@@ -581,10 +608,14 @@ pub const Decoder = struct {
     pos: usize = 0,
     /// The current nesting depth.
     depth: usize = 0,
+    /// The number of values that the rest of this decode can still allocate.
+    /// One decode shares one budget, so a repeated small structure cannot
+    /// exhaust memory. Read the note on `elementBudget` for the reasoning.
+    budget: usize,
 
     /// Returns a decoder that reads `bytes` from the start.
     pub fn init(bytes: []const u8) Decoder {
-        return .{ .bytes = bytes };
+        return .{ .bytes = bytes, .budget = elementBudget(bytes.len) };
     }
 
     /// Returns true when the decoder has read every byte.
@@ -596,6 +627,13 @@ pub const Decoder = struct {
     /// `Value.deinit` and the same allocator.
     pub fn next(d: *Decoder, gpa: Allocator) DecodeError!Value {
         return d.decodeValue(gpa);
+    }
+
+    /// Takes `count` values from the budget of this decode, and reports
+    /// `error.Malformed` when the budget cannot pay for them.
+    fn spend(d: *Decoder, count: usize) DecodeError!void {
+        if (count > d.budget) return error.Malformed;
+        d.budget -= count;
     }
 
     fn remaining(d: *const Decoder) usize {
@@ -753,6 +791,7 @@ pub const Decoder = struct {
             for (items.items) |item| item.deinit(gpa);
             items.deinit(gpa);
         }
+        try d.spend(count);
         try items.ensureTotalCapacity(gpa, count);
 
         d.depth += 1;
@@ -781,6 +820,7 @@ pub const Decoder = struct {
             }
             entries.deinit(gpa);
         }
+        try d.spend(count);
         try entries.ensureTotalCapacity(gpa, count / 2);
 
         d.depth += 1;
@@ -839,6 +879,7 @@ pub const Decoder = struct {
             for (items.items) |item| item.deinit(gpa);
             items.deinit(gpa);
         }
+        try d.spend(count);
         try items.ensureTotalCapacity(gpa, count);
 
         for (0..count) |_| items.appendAssumeCapacity(try d.decodeBody(gpa, code));
@@ -1403,6 +1444,48 @@ test "the decoder rejects an array count that the input cannot hold" {
     );
 }
 
+test "the decode budget bounds many small zero-width arrays" {
+    const gpa = testing.allocator;
+
+    // Each inner array costs 10 octets and declares 8192 null elements, which
+    // `max_zero_width_elements` allows one at a time. A list of a thousand of
+    // them allocated about 328 MB before the budget existed.
+    const inner: [10]u8 = .{ 0xf0, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x20, 0x00, 0x40 };
+    const count = 1000;
+
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(gpa);
+    try input.append(gpa, @intFromEnum(Constructor.list32));
+    var header: [8]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], count * inner.len + 4, .big);
+    std.mem.writeInt(u32, header[4..8], count, .big);
+    try input.appendSlice(gpa, &header);
+    for (0..count) |_| try input.appendSlice(gpa, &inner);
+
+    try testing.expectError(error.Malformed, decode(gpa, input.items));
+}
+
+test "one array of the largest legal zero-width count still decodes" {
+    const gpa = testing.allocator;
+
+    // The budget must not reject what `max_zero_width_elements` allows.
+    var input: [10]u8 = .{ 0xf0, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x40 };
+    std.mem.writeInt(u32, input[5..9], max_zero_width_elements, .big);
+
+    const value = try decode(gpa, &input);
+    defer value.deinit(gpa);
+    try testing.expectEqual(@as(usize, max_zero_width_elements), value.array.items.len);
+}
+
+test "the decoder invariant holds for a float that is not a number" {
+    // `72 7f c0 00 00` is a legal float encoding. A NaN is never equal to a
+    // NaN, so an invariant that compares the values reports a false defect.
+    try testing.expect(try checkDecoder(testing.allocator, &.{ 0x72, 0x7f, 0xc0, 0x00, 0x00 }));
+    try testing.expect(try checkDecoder(testing.allocator, &.{
+        0x82, 0x7f, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }));
+}
+
 test "the decoder rejects an input that nests too deep" {
     const gpa = testing.allocator;
     // Each described constructor adds one level.
@@ -1428,7 +1511,7 @@ test "the decoder reads two values from one slice" {
 
 test "the size agrees with the encoder" {
     // `encodedSize` and `encode` walk the value with separate code, so every
-    // test above checks the two against each other through `expectEncoding`
+    // test above compares the two through `expectEncoding`
     // and `expectRoundTrip`. This test covers the shapes that the golden
     // vectors do not reach.
     const descriptor: Value = .{ .symbol = "d" };
@@ -1474,7 +1557,7 @@ test "a decode that runs out of memory frees what it allocated" {
     }
 }
 
-/// Runs one input through the decoder and checks the rules that must hold for
+/// Runs one input through the decoder and applies the rules that must hold for
 /// every input. The decoder must never crash and never leak. It either returns
 /// `error.Malformed`, or it returns a value that encodes again and decodes to
 /// the same value.
@@ -1501,7 +1584,19 @@ fn checkDecoder(gpa: Allocator, input: []const u8) !bool {
         error.Malformed => return error.DecodeRejectedItsOwnEncoding,
     };
     defer again.deinit(gpa);
-    try testing.expectEqualDeep(value, again);
+
+    // Compare the two encodings, not the two values. `expectEqualDeep`
+    // compares a float with `==`, and a NaN is never equal to a NaN, so it
+    // reports a legal float encoding such as `72 7f c0 00 00` as a defect.
+    // The encoding of a decoded value is deterministic, so the comparison of
+    // the bytes is the stronger test, and it holds for a NaN.
+    var again_sink: Writer.Allocating = .init(gpa);
+    defer again_sink.deinit();
+    encode(again, &again_sink.writer) catch |err| switch (err) {
+        error.WriteFailed => return true,
+        error.InvalidValue => return error.EncodeRejectedADecodedValue,
+    };
+    try testing.expectEqualSlices(u8, sink.written(), again_sink.written());
     return true;
 }
 
@@ -1567,7 +1662,7 @@ test "every fuzz seed is a legal encoding" {
 }
 
 // `std.testing.fuzz` needs `zig build test --fuzz`, and that mode does not
-// build with every toolchain. This test drives the same checks from a seeded
+// build with every toolchain. This test drives the same rules from a seeded
 // generator, so `zig build test` alone still exercises the decoder against
 // many inputs. It mutates valid encodings, because purely random bytes stop
 // at the first constructor octet almost every time.
