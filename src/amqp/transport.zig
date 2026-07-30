@@ -43,7 +43,16 @@
 //! every field. The SASL code builds the initial response in a stack buffer and
 //! erases the buffer before it returns, on the error path as well. `close`
 //! erases the write buffers, because the cleartext of the initial response sits
-//! in one of them until another write covers it.
+//! in one of them until another write covers it. The failure paths of `connect`
+//! erase the same buffers, because a rejected password is the usual failure of
+//! a PLAIN dialog and it must not survive in freed memory.
+//!
+//! No test covers that last rule, and the reason is worth stating. Under
+//! runtime safety `std.mem.Allocator.free` fills the memory with `undefined`
+//! before it calls `rawFree` (`mem/Allocator.zig:448`), so a test allocator
+//! always sees an erased buffer and can never fail. A release build skips that
+//! fill, so the credential would survive there. The rule therefore holds by
+//! reading the code, and a test would give false assurance.
 //!
 //! # The flush rule that this file exists to hold
 //!
@@ -153,7 +162,10 @@ pub const Options = struct {
 // -------------------------------------------------------------------------
 
 /// The number of octets that `Diagnostics` keeps for the offered mechanisms.
-/// Section 5.3.1 holds a SASL frame at 512 octets, so the list always fits.
+///
+/// Section 5.3.1 holds a SASL frame at 512 octets, so a peer can name more
+/// mechanisms than this buffer holds. `offered` therefore truncates, and it
+/// says so. The text is for a person reading a failure, not for a decision.
 pub const max_offered_text: usize = 256;
 
 /// The detail of a failed handshake.
@@ -281,7 +293,13 @@ pub const Transport = struct {
         const net_read_buf = try gpa.alloc(u8, buf_len);
         errdefer gpa.free(net_read_buf);
         const net_write_buf = try gpa.alloc(u8, buf_len);
-        errdefer gpa.free(net_write_buf);
+        // The buffer holds the cleartext of a PLAIN initial response on the
+        // plain path, and this errdefer runs when the SASL dialog fails. A
+        // rejected password is the usual failure, so erase before the free.
+        errdefer {
+            std.crypto.secureZero(u8, net_write_buf);
+            gpa.free(net_write_buf);
+        }
 
         const stream = try host_name.connect(io, port, .{
             .mode = .stream,
@@ -301,10 +319,16 @@ pub const Transport = struct {
         };
 
         if (options.tls == .required) try self.startTls(host);
+        // The cleartext of a PLAIN initial response sits in `stage_buf` and in
+        // `write_buf` until another write covers it, and this errdefer runs
+        // when the SASL dialog fails. Erase both before the free, as `close`
+        // does on the path that succeeds.
         errdefer if (self.tls_state) |*state| {
             state.bundle.deinit(gpa);
             gpa.free(state.read_buf);
+            std.crypto.secureZero(u8, state.write_buf);
             gpa.free(state.write_buf);
+            std.crypto.secureZero(u8, state.stage_buf);
             gpa.free(state.stage_buf);
         };
 
@@ -502,6 +526,10 @@ pub fn performSasl(
         var response: [max_initial_response]u8 = undefined;
         defer std.crypto.secureZero(u8, &response);
 
+        // Section 5.3.3.2 gives `sasl-init` an optional `hostname` field, for a
+        // peer that serves more than one virtual host. This call omits it,
+        // because the brokers in scope select the host from the connection.
+        // A peer with virtual hosts would need it.
         const init: performatives.SaslInit = .{
             .mechanism = .of(sasl.mechanismName()),
             .initial_response = switch (sasl) {
