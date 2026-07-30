@@ -599,6 +599,12 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Value {
 /// fields below hold an invariant that the methods keep. Do not write them.
 /// A write puts the cursor outside the slice, and the next read then traps on
 /// an integer overflow.
+///
+/// One decoder holds one budget for the whole slice, and every call to `next`
+/// takes from it. So a slice that holds many arrays of zero-width elements can
+/// reject a later value that decodes on its own. This is deliberate. A budget
+/// for each call would restore the amplification, because a sender would then
+/// simply send more values. Read the note on `elementBudget`.
 pub const Decoder = struct {
     /// The bytes that the decoder reads. A compound encoding narrows this
     /// slice while it reads its items, and restores it afterwards, so an item
