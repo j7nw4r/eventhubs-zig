@@ -17,7 +17,8 @@
 # compiler assembles at build time, such as "com.micro" ++ "soft", and it cannot
 # see text in an encoding other than UTF-8. Code review remains the backstop.
 # The check must never report a clean tree that it did not read, so every error
-# below exits 2 instead of passing.
+# below exits 2 instead of passing. A named pipe in the tree can block the read
+# on some platforms, but git cannot commit one.
 
 set -eu
 
@@ -50,6 +51,14 @@ for dir in "$@"; do
         found=1
     fi
 
+    # The names of the files and the directories, relative to the directory that
+    # this loop scans. They are relative on purpose: the absolute path holds the
+    # name of the repository, which contains a forbidden string itself.
+    names=$(CDPATH='' cd -- "$dir" && find .) || {
+        printf 'purity: cannot list the file names of %s\n' "$dir" >&2
+        exit 2
+    }
+
     for pattern in $patterns; do
         # grep exits 0 when it matches, 1 when it does not, and 2 on an error.
         # An error must fail the build. grep exits 2 even when it also found a
@@ -63,6 +72,20 @@ for dir in "$@"; do
         elif [ "$status" -ne 1 ]; then
             printf 'purity: grep exited %s on %s. The check did not read the tree.\n' \
                 "$status" "$dir" >&2
+            exit 2
+        fi
+
+        # A forbidden string in a file name or a directory name ships in the
+        # package too, and the content grep above never sees it.
+        status=0
+        name_matches=$(printf '%s\n' "$names" | grep -iF -- "$pattern") || status=$?
+        if [ "$status" -eq 0 ]; then
+            printf 'purity: found the forbidden string "%s" in a name under %s\n' \
+                "$pattern" "$dir" >&2
+            printf '%s\n' "$name_matches" >&2
+            found=1
+        elif [ "$status" -ne 1 ]; then
+            printf 'purity: grep exited %s on the file names of %s.\n' "$status" "$dir" >&2
             exit 2
         fi
     done
