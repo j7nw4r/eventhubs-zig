@@ -23,6 +23,10 @@ pub const performatives = @import("performatives.zig");
 /// The message format: `Message`, `Header`, `Properties`, and the sections.
 pub const message = @import("message.zig");
 
+/// The frame layer: `Frame`, `readFrame`, `writeFrame`, and the protocol
+/// headers.
+pub const framing = @import("framing.zig");
+
 /// One AMQP 1.0 value. The decoder allocates it, and `Value.deinit` frees it.
 pub const Value = types.Value;
 
@@ -70,6 +74,43 @@ pub const Decoded = performatives.Decoded;
 /// One AMQP 1.0 message of format 0.
 pub const Message = message.Message;
 
+/// One frame that `readFrame` produced.
+pub const Frame = framing.Frame;
+
+/// The body of one frame: one performative, or one SASL security frame.
+pub const Body = framing.Body;
+
+/// The type code of a frame header: an AMQP frame or a SASL frame.
+pub const FrameType = framing.FrameType;
+
+/// Writes one frame to a `std.Io.Writer`.
+pub const writeFrame = framing.writeFrame;
+
+/// Writes one empty frame. The empty frame is the heartbeat.
+pub const writeEmptyFrame = framing.writeEmptyFrame;
+
+/// Reads one frame from a `std.Io.Reader`.
+pub const readFrame = framing.readFrame;
+
+/// The protocol header of the AMQP layer.
+pub const amqp_protocol_header = framing.amqp_protocol_header;
+
+/// The protocol header of the SASL security layer.
+pub const sasl_protocol_header = framing.sasl_protocol_header;
+
+/// Sends a protocol header and makes sure that the peer answers with the same
+/// one.
+pub const exchangeProtocolHeader = framing.exchangeProtocolHeader;
+
+/// The lower bound for the negotiated maximum frame size, in octets.
+pub const min_max_frame_size = framing.min_max_frame_size;
+
+/// The errors that `writeFrame` returns.
+pub const WriteFrameError = framing.WriteFrameError;
+
+/// The errors that `readFrame` returns.
+pub const ReadFrameError = framing.ReadFrameError;
+
 /// The version of the AMQP specification that this library speaks.
 pub const protocol_version = "1.0";
 
@@ -83,4 +124,5 @@ test {
     _ = codec;
     _ = performatives;
     _ = message;
+    _ = framing;
 }
