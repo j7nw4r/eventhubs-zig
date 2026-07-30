@@ -1266,7 +1266,12 @@ test "a send during the close handshake is refused before the peer answers" {
 
     const connection = try Connection.open(gpa, io, stream, .{
         .container_id = "the-client",
-        .close_timeout = .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } },
+        // The timeout is generous on purpose. The test acts inside the window
+        // between the close frame and the timeout, and a short timeout lets a
+        // slow machine close that window early. The test would then pass
+        // because `failure` is set, and not because the guard works, which is
+        // a false pass. The watchdog still bounds the test.
+        .close_timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
     });
     defer connection.deinit();
 
