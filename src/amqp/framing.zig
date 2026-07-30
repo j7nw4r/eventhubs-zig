@@ -185,8 +185,16 @@ pub const Frame = struct {
     channel: u16,
     /// The decoded body, or null for an empty heartbeat frame.
     body: ?Body,
-    /// The octets after the body, in the caller buffer. Only a transfer frame
-    /// carries them. The slice is empty for every other frame.
+    /// The octets after the body, in the caller buffer.
+    ///
+    /// Section 2.3.1 defines the frame body as a performative and then an
+    /// opaque payload, so this layer accepts a payload after any AMQP
+    /// performative and passes it up. In practice a transfer frame carries
+    /// one and the other performatives do not, so the slice is normally
+    /// empty. The connection layer decides whether a payload after another
+    /// performative is a protocol error, because this layer holds no session
+    /// state. A SASL frame is the exception: section 5.3.1 gives it exactly
+    /// one AMQP type, so trailing octets there are malformed.
     payload: []const u8,
     /// The arena that holds every slice of `body`.
     arena_state: std.heap.ArenaAllocator.State,
