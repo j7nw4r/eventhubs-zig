@@ -700,12 +700,19 @@ pub const Session = struct {
     /// Gives the channels back one time, after the end frame of the remote peer
     /// arrived.
     ///
-    /// Section 2.5.2 note (2) disassociates the session from the incoming
+    /// Section 2.5.2 note (2) disassociates the session from its outgoing
     /// channel at that moment, and section 2.5.1 recommends the lowest free
-    /// number, so the remote peer puts the number back to work at once. A
-    /// session that held the binding until `end` or `deinit` would take the
-    /// answer that belongs to the next session of the peer, and that session
-    /// would then wait for a frame that cannot arrive.
+    /// number, so a later session of this peer can take the number at once.
+    ///
+    /// The incoming channel is the number that the remote peer sends on, and
+    /// the demultiplexer already removed that binding when it routed the end
+    /// frame. Note (1) of section 2.5.2 puts the release at that point, and
+    /// only the demultiplexer can do it in frame order: this task runs after
+    /// the demultiplexer routed the frames that follow the end frame, and the
+    /// remote peer reuses its number for the very next session. This call
+    /// therefore does nothing on the incoming side after an end frame. A begin
+    /// handshake that fails sees no end frame, and `unregisterChannel` then
+    /// removes the binding itself.
     ///
     /// `unregistered` is a plain bool, because the router task writes it and
     /// `end` and `deinit` read it only after `stopRouter` joined that task.
@@ -776,8 +783,8 @@ pub const Session = struct {
                     // frame. The end of the remote peer arrived, so the channel
                     // is free again.
                     self.sendEndUncancelable(null) catch {};
-                    self.remote_end_seen.store(true, .release);
                     self.releaseChannelsOnce();
+                    self.remote_end_seen.store(true, .release);
                     if (remote.error_condition == null) return error.SessionEnded;
                     return error.SessionRemoteError;
                 },
@@ -1105,6 +1112,10 @@ pub const Session = struct {
     /// within `Options.end_timeout`. It ends the session either way, so every
     /// link wakes.
     ///
+    /// One task calls this. Two tasks that call it together race the guard of
+    /// `releaseChannelsOnce`, and the loser then calls `unregisterChannel` a
+    /// second time, which returns at once on the key that is already gone.
+    ///
     /// After the call the session touches the connection no more, except for
     /// the `unregisterChannel` of `deinit`.
     pub fn end(
@@ -1198,10 +1209,11 @@ pub const Session = struct {
             const is_end = if (owned.body) |body| body == .end else false;
             owned.deinit();
             if (!is_end) return .keep_reading;
-            self.remote_end_seen.store(true, .release);
             // Section 2.5.4 ends the discarding state here, and section 2.5.2
-            // note (2) frees the channels with it.
+            // note (2) frees the channel with it. The flag publishes after the
+            // release, so a task that waits on the flag finds the number free.
             self.releaseChannelsOnce();
+            self.remote_end_seen.store(true, .release);
             return .stop;
         }
 
@@ -1267,13 +1279,15 @@ pub const Session = struct {
 
     /// Answers the end frame of the remote peer and ends the session.
     fn handleRemoteEnd(self: *Session, performative: performatives.End) Routing {
-        self.remote_end_seen.store(true, .release);
         // Section 2.5.2: a peer answers an end frame with an end frame.
         self.sendEndBestEffort(null);
-        // The handshake is over, so both channel numbers go back now. The
-        // caller can hold this session for as long as it wants, and the remote
-        // peer can begin its next session on the same number at once.
+        // The handshake is over, so the outgoing channel number goes back now.
+        // The caller can hold this session for as long as it wants, and a later
+        // session of this peer can take the number at once. The flag publishes
+        // after the release, so a task that waits on the flag finds the number
+        // free.
         self.releaseChannelsOnce();
+        self.remote_end_seen.store(true, .release);
 
         const condition_error = performative.error_condition orelse {
             self.fail(error.SessionEnded, null, null);
@@ -3422,4 +3436,100 @@ test "a transfer that passes the window of the remote peer is refused" {
         error.RemoteWindowClosed,
         session.sendTransfer(.{ .handle = 0 }, "two"),
     );
+}
+
+test "a stalled router leaves the answer on the reused channel to the new session" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage_a: Storage = try .init(gpa, 4);
+    defer storage_a.deinit(gpa);
+    var storage_b: Storage = try .init(gpa, 4);
+    defer storage_b.deinit(gpa);
+
+    // Session A lives on local 0, and the peer sends on its channel 5. Session
+    // B begins on local 1 while A still runs. The peer then ends A and answers
+    // B on channel 5, in two frames that arrive one after the other. Note (1)
+    // of section 2.5.2 frees the channel at the peer when it sends its end, and
+    // section 2.5.1 recommends the lowest free number, so that wire order is
+    // legal and common.
+    //
+    // The test holds `state_mutex` of A, so the router task of A blocks inside
+    // `sendEndBestEffort` and cannot give the channels back. A slow router
+    // gives the same window in production: `sendTransfer` holds that lock
+    // across the socket write, and the write stalls under back pressure. The
+    // demultiplexer must free the binding of channel 5 itself, or the answer
+    // for B lands in the dead queue of A and B waits inside `begin` forever.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const gate_a = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+    const gate_b = sink.written().len;
+    try appendFrame(&sink, 5, .{ .end = .{ .error_condition = .{
+        .condition = .of("amqp:internal-error"),
+        .description = "the broker lost the session",
+    } } }, "");
+    try appendFrame(&sink, 5, remoteBegin(1), "");
+
+    // The frames of this peer are the open, the begin of A, and the begin of B.
+    var gates = [_]Gate{
+        .{ .at = gate_a, .after_frames = 2 },
+        .{ .at = gate_b, .after_frames = 3 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const a = try Session.begin(connection, &storage_a, .{ .incoming_window = 4 });
+    defer a.deinit();
+    try testing.expectEqual(@as(?u16, 5), a.remote_channel);
+
+    try a.state_mutex.lock(io);
+
+    var b_task: BeginTask = .{
+        .connection = connection,
+        .storage = &storage_b,
+        .options = .{ .incoming_window = 4 },
+    };
+    var task = io.concurrent(BeginTask.run, .{&b_task}) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => {
+            a.state_mutex.unlock(io);
+            return error.SkipZigTest;
+        },
+    };
+    defer b_task.deinit();
+
+    // The begin frame of B opens the second gate, and the demultiplexer then
+    // routes the end of A and the answer for B while the router of A waits for
+    // the lock.
+    try io.sleep(.fromMilliseconds(100), .awake);
+    a.state_mutex.unlock(io);
+
+    try a.ended.wait(io);
+    try testing.expectEqual(Error.SessionRemoteError, a.failure().?.err);
+
+    // B must get the answer that the peer sent on the reused channel 5.
+    var settle: usize = 0;
+    while (b_task.session == null and b_task.result == null and settle < 200) : (settle += 1) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    if (b_task.session == null and b_task.result == null) {
+        task.cancel(io);
+        return error.StaleBindingSwallowedTheAnswer;
+    }
+
+    task.await(io);
+    try testing.expectEqual(@as(?anyerror, null), b_task.result);
+    const second = b_task.session.?;
+    try testing.expectEqual(@as(u16, 1), second.channel);
+    try testing.expectEqual(@as(?u16, 5), second.remote_channel);
+    try testing.expectEqual(@as(u32, 100), second.window.remote_incoming_window);
+    try testing.expect(second.failure() == null);
+    try testing.expect(connection.failure() == null);
 }

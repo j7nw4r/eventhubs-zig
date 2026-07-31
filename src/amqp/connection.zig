@@ -90,6 +90,13 @@
 //! channel of the remote peer, and a second answer for the same session binds
 //! nothing.
 //!
+//! The demultiplexer also removes the binding, in the same task and in frame
+//! order, when it routes the end frame of the remote peer. Note (1) of section
+//! 2.5.2 disassociates the incoming channel at the endpoint that receives that
+//! frame, and this task is that endpoint. A session that removed the binding on
+//! its own task would leave it in place for the frames that follow, and the
+//! remote peer puts the number back to work at once.
+//!
 //! # The write buffer
 //!
 //! Every write path writes one frame and then flushes. The flush puts the
@@ -243,8 +250,20 @@ const ChannelEntry = struct {
     queue: *FrameQueue,
     /// The outgoing channel of the remote peer, or null until its begin frame
     /// arrives. Section 2.5.1 makes the two numbers independent, and the
-    /// answering begin frame binds them together.
+    /// answering begin frame binds them together. The demultiplexer clears it
+    /// again when the end frame of the remote peer arrives.
     remote: ?u16,
+};
+
+/// The registration of one session, under the outgoing channel of the remote
+/// peer.
+const RemoteEntry = struct {
+    /// The queue that receives the frames of the session.
+    queue: *FrameQueue,
+    /// The outgoing channel of this peer, which is the partner of this
+    /// binding. The demultiplexer needs it to clear `ChannelEntry.remote` when
+    /// the end frame of the remote peer arrives.
+    local: u16,
 };
 
 // -------------------------------------------------------------------------
@@ -294,9 +313,10 @@ pub const Connection = struct {
     /// number. The `remote-channel` field of an incoming begin frame reads
     /// this table.
     local_channels: std.AutoHashMapUnmanaged(u16, ChannelEntry),
-    /// The queue of each outgoing channel of the remote peer, by channel
-    /// number. The demultiplexer routes every incoming frame by this table.
-    remote_channels: std.AutoHashMapUnmanaged(u16, *FrameQueue),
+    /// The registration of each outgoing channel of the remote peer, by
+    /// channel number. The demultiplexer routes every incoming frame by this
+    /// table.
+    remote_channels: std.AutoHashMapUnmanaged(u16, RemoteEntry),
 
     /// The step of the terminal state. Read the note on `fail`.
     state: std.atomic.Value(u8),
@@ -546,7 +566,7 @@ pub const Connection = struct {
         var locals = self.local_channels.valueIterator();
         while (locals.next()) |entry| entry.queue.close(self.io);
         var remotes = self.remote_channels.valueIterator();
-        while (remotes.next()) |queue| queue.*.close(self.io);
+        while (remotes.next()) |entry| entry.queue.close(self.io);
     }
 
     // ---------------------------------------------------------------------
@@ -598,6 +618,11 @@ pub const Connection = struct {
     /// frames to a queue that the session already closed, and a later session
     /// of the peer on the same number never reaches its own queue.
     ///
+    /// The demultiplexer normally removed the binding of the remote peer
+    /// already, at the end frame of that peer, and this call then finds the
+    /// entry with no remote number. The binding of a begin handshake that
+    /// failed sees no end frame, and this call is the one that removes it.
+    ///
     /// The demultiplexer can still hold the pointer, so the memory of the
     /// queue must stay valid until `deinit` returns.
     ///
@@ -625,8 +650,9 @@ pub const Connection = struct {
         UnknownChannel,
     };
 
-    /// Returns the queue that receives the frames of `channel`, and binds the
-    /// channel when an answering begin frame arrives on it.
+    /// Returns the queue that receives the frames of `channel`, binds the
+    /// channel when an answering begin frame arrives on it, and removes the
+    /// binding when an end frame arrives on it.
     ///
     /// `answered` carries the `remote-channel` field of a begin frame, and null
     /// for every other frame. Section 2.5.1 lets the remote peer answer on any
@@ -634,16 +660,36 @@ pub const Connection = struct {
     /// field, so the answer is the frame that binds the two numbers together.
     /// Every later frame of the session routes by the binding alone.
     ///
+    /// `ending` is true for an end frame. Note (1) of section 2.5.2 puts the
+    /// disassociation of the incoming channel at the endpoint that receives
+    /// that frame, so the binding goes here, in frame order, and the frame
+    /// still reaches the session. The remote peer takes the lowest free number
+    /// for its next session, which section 2.5.1 recommends, so the answering
+    /// begin of that session can be the very next frame on the wire.
+    ///
     /// The call takes `channels_mutex` one time, so no other task can register
     /// a channel between the lookup and the bind.
     ///
     /// Only the demultiplexer task calls this, so no frame on the new channel
     /// can arrive before the bind finishes.
-    fn routeChannel(self: *Connection, channel: u16, answered: ?u16) RouteError!*FrameQueue {
+    fn routeChannel(
+        self: *Connection,
+        channel: u16,
+        answered: ?u16,
+        ending: bool,
+    ) RouteError!*FrameQueue {
         self.channels_mutex.lockUncancelable(self.io);
         defer self.channels_mutex.unlock(self.io);
 
-        if (self.remote_channels.get(channel)) |queue| return queue;
+        if (self.remote_channels.getPtr(channel)) |binding| {
+            const queue = binding.queue;
+            if (ending) {
+                const partner = binding.local;
+                _ = self.remote_channels.remove(channel);
+                if (self.local_channels.getPtr(partner)) |entry| entry.remote = null;
+            }
+            return queue;
+        }
 
         const local = answered orelse return error.UnknownChannel;
         const entry = self.local_channels.getPtr(local) orelse return error.UnknownChannel;
@@ -660,7 +706,7 @@ pub const Connection = struct {
         // insert that replaced a live binding would give the frames of one
         // session to the queue of another.
         std.debug.assert(!bound.found_existing);
-        bound.value_ptr.* = entry.queue;
+        bound.value_ptr.* = .{ .queue = entry.queue, .local = local };
         entry.remote = channel;
         return entry.queue;
     }
@@ -866,8 +912,12 @@ pub const Connection = struct {
         // answer usually arrives on a channel that no session registered. The
         // bind happens in this task, and not in the session, because a later
         // frame on the new channel would otherwise race the bind.
+        // Note (1) of section 2.5.2 frees the incoming channel of this endpoint
+        // at the end frame of the remote peer, so the release runs in this task
+        // and in frame order. A release on the task of the session comes too
+        // late for the frames that follow the end frame.
         const answered: ?u16 = if (body == .begin) body.begin.remote_channel else null;
-        const queue = self.routeChannel(owned.channel, answered) catch |err| {
+        const queue = self.routeChannel(owned.channel, answered, body == .end) catch |err| {
             owned.deinit();
             switch (err) {
                 error.OutOfMemory => self.fail(
@@ -1580,6 +1630,65 @@ test "an answering begin binds the channel of the peer and leaves the local tabl
     try testing.expectEqual(@as(u16, 5), first.channel);
     try testing.expectEqual(@as(?u16, 0), first.body.?.begin.remote_channel);
 
+    try testing.expect(connection.failure() == null);
+}
+
+test "an end frame frees the incoming channel for the next session of the peer" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    // Note (1) of section 2.5.2 disassociates the incoming channel of this
+    // endpoint at the end frame of the remote peer. The peer takes the lowest
+    // free number for its next session, so it answers that session on the same
+    // channel 5, and that answer can be the very next frame. The unbind must
+    // run in this task and in frame order, or the answer reaches the queue of
+    // the session that ended and the new session waits forever.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try appendFrame(&sink, 0, .{ .open = .{ .container_id = "the-peer" } }, "");
+    const gate_at = sink.written().len;
+    try appendFrame(&sink, 5, .{ .begin = .{ .remote_channel = 0 } }, "");
+    try appendFrame(&sink, 5, .{ .end = .{} }, "");
+    try appendFrame(&sink, 5, .{ .begin = .{ .remote_channel = 1 } }, "");
+
+    var peer: Peer = .init(gpa, io, sink.written(), .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+    // The gate holds every frame back until both sessions hold a channel.
+    peer.reader.gate_at = gate_at;
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    var buf_one: [4]Frame = undefined;
+    var buf_two: [4]Frame = undefined;
+    var queue_one: FrameQueue = .init(&buf_one);
+    var queue_two: FrameQueue = .init(&buf_two);
+    try connection.registerChannel(0, &queue_one);
+    try connection.registerChannel(1, &queue_two);
+    peer.reader.gate.set(io);
+
+    // The first session takes its answer, and then the end frame of the peer.
+    var answer = try queue_one.getOne(io);
+    answer.deinit();
+    var ended = try queue_one.getOne(io);
+    defer ended.deinit();
+    try testing.expect(ended.body.? == .end);
+
+    // The answer for the second session arrives on the same channel 5, and it
+    // reaches the queue of that session.
+    var second = try queue_two.getOne(io);
+    defer second.deinit();
+    try testing.expectEqual(@as(u16, 5), second.channel);
+    try testing.expectEqual(@as(?u16, 1), second.body.?.begin.remote_channel);
+
+    // The script holds no further frame, so the tables rest here. Channel 5 now
+    // belongs to the second session, and the first session kept its own number.
+    try testing.expectEqual(@as(u32, 1), connection.remote_channels.count());
+    try testing.expectEqual(@as(u16, 1), connection.remote_channels.get(5).?.local);
+    try testing.expectEqual(@as(?u16, null), connection.local_channels.get(0).?.remote);
     try testing.expect(connection.failure() == null);
 }
 
