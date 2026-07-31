@@ -1383,7 +1383,12 @@ pub const Session = struct {
                 // that names no handle asks for the session state alone, which
                 // this endpoint can answer here. A flow that names a handle
                 // asks for link state, and the link answers that itself.
-                if (echo and link_handle == null) {
+                //
+                // An endpoint that sent its end frame is in END_SENT of
+                // section 2.5.5, where it "MAY receive frames, but cannot
+                // send them". The echo of a flow that crossed the end frame
+                // on the wire must therefore stay unanswered.
+                if (echo and link_handle == null and !self.end_sent) {
                     self.connection.send(
                         self.channel,
                         .{ .flow = self.window.sessionFlow() },
@@ -1471,6 +1476,13 @@ pub const Session = struct {
 
         self.window.receiveTransfer() catch return .violation;
         if (!self.window.needsReplenishment()) return .ok;
+
+        // Section 2.5.5 puts an endpoint that sent its end frame in END_SENT,
+        // where it "MAY receive frames, but cannot send them". The accounting
+        // above stays, because the window must stay correct for the frames
+        // that still arrive. Only the advertisement stops, and the remote peer
+        // needs none of it after the end frame.
+        if (self.end_sent) return .ok;
 
         const body = self.window.replenishedFlow();
         self.connection.send(self.channel, .{ .flow = body }, "") catch |err| {
@@ -3532,4 +3544,67 @@ test "a stalled router leaves the answer on the reused channel to the new sessio
     try testing.expectEqual(@as(u32, 100), second.window.remote_incoming_window);
     try testing.expect(second.failure() == null);
     try testing.expect(connection.failure() == null);
+}
+
+test "an echo flow that crosses the local end draws no frame after the end" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: Storage = try .init(gpa, 4);
+    defer storage.deinit(gpa);
+
+    // This peer calls end. A flow with an echo request from the remote peer
+    // crosses that end frame on the wire. Section 2.5.5 puts this endpoint in
+    // END_SENT, where it "MAY receive frames, but cannot send them", so the
+    // answer to the echo must not go out after the end frame.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+    const cross_at = sink.written().len;
+    try appendFrame(&sink, 5, .{ .flow = .{
+        .next_incoming_id = 0,
+        .incoming_window = 50,
+        .next_outgoing_id = 0,
+        .outgoing_window = 60,
+        .echo = true,
+    } }, "");
+    try appendFrame(&sink, 5, .{ .end = .{} }, "");
+
+    // Frame 3 of this peer is its end frame. The flow of the remote peer
+    // arrives after it, which models the crossing.
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = cross_at, .after_frames = 3 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 4 });
+    defer session.deinit();
+
+    try session.end(null);
+
+    var written: SentFrames = try .parse(gpa, peer.sent());
+    defer written.deinit();
+
+    // Walk the wire in order. No session frame comes after the end frame.
+    var end_seen = false;
+    var after_end: usize = 0;
+    for (written.frames.items) |frame| {
+        const body = frame.body orelse continue;
+        if (body == .end) {
+            end_seen = true;
+            continue;
+        }
+        if (end_seen) after_end += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), after_end);
 }
