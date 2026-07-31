@@ -52,15 +52,21 @@
 //!
 //! # The channel numbers
 //!
-//! Section 2.5.1 lets the remote peer answer a begin on any free channel of its
-//! own, and it names that channel in the frame header. The demultiplexer of the
-//! connection routes by that channel number alone, so a session can only read
-//! frames that arrive on the channel that it registered. This module therefore
-//! needs the remote peer to answer on the same channel number that this peer
-//! chose. Both peers pick the lowest free channel, which section 2.5.1
-//! recommends, so the numbers agree in practice. A peer that answers on a
-//! different channel ends the connection with a protocol error, because no
-//! session registered that channel.
+//! Section 2.5.1 gives a session two channel numbers. `channel` is the outgoing
+//! channel of this peer, and `remote_channel` is the outgoing channel of the
+//! remote peer. The two are independent, and each peer picks its own.
+//!
+//! `begin` registers `channel` with the connection and sends its begin frame.
+//! The remote peer answers on any free channel of its own, and it names
+//! `channel` in the `remote-channel` field of that frame. The demultiplexer of
+//! the connection reads that field, binds the channel that the answer arrived
+//! on to the queue of this session, and routes every later frame of the session
+//! by the binding alone.
+//!
+//! The answer is therefore the first frame that a session ever receives. A
+//! frame that arrives on a channel that no answer bound ends the connection
+//! with a protocol error, because the connection cannot tell which session
+//! owns it.
 //!
 //! # The locks
 //!
@@ -94,7 +100,6 @@ const Symbol = performatives.Symbol;
 // The constants
 // -------------------------------------------------------------------------
 
-/// The incoming window that `Options` asks for, in transfer frames.
 /// The distance at which an RFC 1982 serial difference counts as negative.
 ///
 /// Section 2.5.6 applies RFC 1982 serial number arithmetic to the transfer
@@ -102,6 +107,7 @@ const Symbol = performatives.Symbol;
 /// value is behind, and not far ahead.
 const serial_negative: u32 = 1 << 31;
 
+/// The incoming window that `Options` asks for, in transfer frames.
 pub const default_incoming_window: u32 = 5000;
 
 /// The outgoing window that `Options` advertises, in transfer frames.
@@ -329,21 +335,26 @@ pub const Window = struct {
         const incoming_window = flow.incoming_window orelse return error.MissingField;
         const base = flow.next_incoming_id orelse self.initial_outgoing_id;
 
-        // The three values are serial numbers of section 2.5.6, which applies
-        // RFC 1982 arithmetic, so the sum and the difference both wrap.
+        // The formula of section 2.5.6 is the base plus the window of the frame
+        // minus the next outgoing id of this endpoint. The two ids are serial
+        // numbers, so their difference is the number of transfers in flight,
+        // and the window less that number is the room that is left.
+        //
+        // The subtraction runs on the two ids alone, and not on the sum. A
+        // window of 2^31 or more is a legal value that an endpoint uses to mean
+        // no limit, and a sum that carried that window would read as a negative
+        // distance under RFC 1982 and give a room of zero.
         //
         // A peer may hold fewer transfers than this endpoint already sent. It
         // shrinks its window, or its flow carries a view that is older than the
-        // transfers in flight. The difference is then negative, and a plain
-        // wrapping subtraction turns it into a number near 2^32. This endpoint
-        // would read that as room for four billion transfers and flood the
-        // peer, and the peer would end the session for a window violation.
-        //
-        // RFC 1982 reads a difference at or above 2^31 as negative, so the
-        // window is zero in that case.
-        const limit = base +% incoming_window;
-        const distance = limit -% self.next_outgoing_id;
-        self.remote_incoming_window = if (distance >= serial_negative) 0 else distance;
+        // transfers in flight. The saturating subtraction gives zero for that
+        // case, and this endpoint then waits for the next flow. A difference at
+        // or above 2^31 is negative under RFC 1982, which means that the peer
+        // reports an id that this endpoint has not reached, so nothing is in
+        // flight.
+        const in_flight = self.next_outgoing_id -% base;
+        const flight = if (in_flight >= serial_negative) 0 else in_flight;
+        self.remote_incoming_window = incoming_window -| flight;
     }
 
     /// Accounts for one outgoing transfer frame.
@@ -676,12 +687,6 @@ pub const Session = struct {
         }
     }
 
-    /// Reads frames until the begin frame of the remote peer arrives.
-    ///
-    /// Section 2.5.5 puts this endpoint in the BEGIN_SENT state, where it can
-    /// send but cannot receive, so any other performative before the begin
-    /// breaks the protocol. Section 2.5.3 still lets the remote peer answer
-    /// with an end, and this call reports that as a failure.
     /// Gives back every channel that this session holds.
     ///
     /// Section 2.5.1 gives a session two channel numbers, and the connection
@@ -689,12 +694,20 @@ pub const Session = struct {
     /// arrives. Both must go, or the demultiplexer keeps routing frames to a
     /// queue that this session already closed.
     fn releaseChannels(self: *Session) void {
-        self.connection.unregisterChannel(self.channel);
-        if (self.remote_channel) |remote| {
-            if (remote != self.channel) self.connection.unregisterChannel(remote);
-        }
+        self.connection.unregisterChannel(self.channel, self.remote_channel);
     }
 
+    /// Reads frames until the begin frame of the remote peer arrives.
+    ///
+    /// Section 2.5.5 puts this endpoint in the BEGIN_SENT state, where it can
+    /// send but cannot receive, so any other performative before the begin
+    /// breaks the protocol. Section 2.5.3 still lets the remote peer answer
+    /// with an end, and this call reports that as a failure.
+    ///
+    /// Every path that fails here gives the channels back, because the
+    /// answering begin frame already bound the channel of the remote peer to
+    /// the queue of this session. A session that left the binding behind would
+    /// hold both numbers for the life of the connection.
     fn readRemoteBegin(self: *Session) BeginError!void {
         while (true) {
             var frame = self.queue.getOne(self.io) catch |err| switch (err) {
@@ -711,17 +724,24 @@ pub const Session = struct {
             switch (body) {
                 .begin => |remote| {
                     // Section 2.5.1: the remote channel of the answer names the
-                    // channel that this peer sent its begin on.
+                    // channel that this peer sent its begin on. The
+                    // demultiplexer routes by that field, so a mismatch here
+                    // means that the connection gave this frame to the wrong
+                    // session.
                     if (remote.remote_channel) |answered| {
                         if (answered != self.channel) {
                             self.sendEndUncancelable(.{
                                 .condition = .of(condition.illegal_state),
                                 .description = "the begin frame answered another channel",
                             }) catch {};
+                            self.connection.unregisterChannel(self.channel, frame.channel);
                             return error.SessionProtocolError;
                         }
                     }
-                    self.window.receiveBegin(remote) catch return error.MissingField;
+                    self.window.receiveBegin(remote) catch {
+                        self.connection.unregisterChannel(self.channel, frame.channel);
+                        return error.MissingField;
+                    };
                     self.remote_channel = frame.channel;
                     return;
                 },
@@ -731,7 +751,7 @@ pub const Session = struct {
                     // is free again.
                     self.sendEndUncancelable(null) catch {};
                     self.remote_end_seen.store(true, .release);
-                    self.releaseChannels();
+                    self.connection.unregisterChannel(self.channel, frame.channel);
                     if (remote.error_condition == null) return error.SessionEnded;
                     return error.SessionRemoteError;
                 },
@@ -740,6 +760,7 @@ pub const Session = struct {
                         .condition = .of(condition.illegal_state),
                         .description = "a frame arrived before the begin frame",
                     }) catch {};
+                    self.connection.unregisterChannel(self.channel, frame.channel);
                     return error.SessionProtocolError;
                 },
             }
@@ -1301,6 +1322,10 @@ pub const Session = struct {
 
         const echo = performative.echo orelse false;
         const link_handle = performative.handle;
+        // The block below records a bad frame and leaves the lock, because
+        // `endWithError` takes the same lock. A second unlock on an unlocked
+        // mutex is `unreachable`, so the defer must run one time only.
+        var missing_window = false;
         {
             self.state_mutex.lock(self.io) catch {
                 owned.deinit();
@@ -1310,27 +1335,30 @@ pub const Session = struct {
 
             // Section 2.7.4 makes `incoming-window` mandatory on a flow, so a
             // frame without it is a protocol error and not a zero window.
-            self.window.receiveFlow(performative) catch {
-                self.state_mutex.unlock(self.io);
-                owned.deinit();
-                return self.endWithError(
-                    condition.not_allowed,
-                    "a flow frame carried no incoming window",
-                );
-            };
-
-            // Section 2.7.4: "If set to true then the receiver SHOULD send its
-            // state at the earliest convenient opportunity." A flow that names
-            // no handle asks for the session state alone, which this endpoint
-            // can answer here. A flow that names a handle asks for link state,
-            // and the link answers that itself.
-            if (echo and link_handle == null) {
-                self.connection.send(
-                    self.channel,
-                    .{ .flow = self.window.sessionFlow() },
-                    "",
-                ) catch {};
+            if (self.window.receiveFlow(performative)) |_| {
+                // Section 2.7.4: "If set to true then the receiver SHOULD send
+                // its state at the earliest convenient opportunity." A flow
+                // that names no handle asks for the session state alone, which
+                // this endpoint can answer here. A flow that names a handle
+                // asks for link state, and the link answers that itself.
+                if (echo and link_handle == null) {
+                    self.connection.send(
+                        self.channel,
+                        .{ .flow = self.window.sessionFlow() },
+                        "",
+                    ) catch {};
+                }
+            } else |_| {
+                missing_window = true;
             }
+        }
+
+        if (missing_window) {
+            owned.deinit();
+            return self.endWithError(
+                condition.not_allowed,
+                "a flow frame carried no incoming window",
+            );
         }
 
         const handle = link_handle orelse {
@@ -1894,19 +1922,28 @@ const LinkReader = struct {
     }
 };
 
-/// Runs `Session.begin` in its own task, so that a test can cancel it.
-const Beginner = struct {
+/// Runs `Session.begin` in its own task, so that a test can cancel the call or
+/// act while it waits for the answer of the remote peer.
+const BeginTask = struct {
     connection: *Connection,
     storage: *Storage,
-    io: Io,
+    options: Options = .{},
+    /// The session, or null when the call failed.
+    session: ?*Session = null,
+    /// The error of the call, or null when the call built a session.
     result: ?anyerror = null,
 
-    fn run(self: *Beginner) void {
-        if (Session.begin(self.connection, self.storage, .{})) |session| {
-            session.deinit();
+    fn run(self: *BeginTask) void {
+        if (Session.begin(self.connection, self.storage, self.options)) |session| {
+            self.session = session;
         } else |err| {
             self.result = err;
         }
+    }
+
+    /// Frees the session that the call built, if it built one.
+    fn deinit(self: *BeginTask) void {
+        if (self.session) |session| session.deinit();
     }
 };
 
@@ -2036,6 +2073,33 @@ test "a flow that shrinks the window below the frames in flight gives no room" {
     try testing.expect(!window.canSendTransfer());
 }
 
+test "a flow that advertises the largest window keeps every transfer" {
+    var window: Window = .init(.{ .incoming_window = 5000, .outgoing_window = 5000 });
+
+    // A window of 2^31 or more is a legal value, and an endpoint that wants no
+    // limit sends one. The sum of the base and such a window reads as a
+    // negative distance under RFC 1982, so a formula that clamps the sum gives
+    // a room of zero and stalls every send from then on.
+    try window.receiveFlow(.{
+        .next_incoming_id = 0,
+        .incoming_window = serial_negative,
+        .next_outgoing_id = 0,
+        .outgoing_window = 5000,
+    });
+    try testing.expectEqual(serial_negative, window.remote_incoming_window);
+    try testing.expect(window.canSendTransfer());
+
+    // The transfers in flight still come off the window that the peer gives.
+    window.next_outgoing_id = 10;
+    try window.receiveFlow(.{
+        .next_incoming_id = 0,
+        .incoming_window = std.math.maxInt(u32),
+        .next_outgoing_id = 0,
+        .outgoing_window = 5000,
+    });
+    try testing.expectEqual(std.math.maxInt(u32) - 10, window.remote_incoming_window);
+}
+
 test "a flow without an incoming window is a protocol error" {
     var window: Window = .init(.{
         .incoming_window = 5000,
@@ -2139,6 +2203,10 @@ test "the peer answers the begin on a channel of its own choosing" {
     // and names this peer's channel in `remote-channel`. The two numbers are
     // independent, so the answer arrives on channel 7 while this peer sent its
     // begin on channel 0. A later frame also arrives on channel 7.
+    //
+    // The flow asks for an echo, and the router task answers it. The test waits
+    // for that answer, because the router task owns the channel queue and a
+    // second reader on it would take the frame out of its hands.
     var sink: Writer.Allocating = .init(gpa);
     defer sink.deinit();
     try scriptOpen(&sink);
@@ -2149,9 +2217,13 @@ test "the peer answers the begin on a channel of its own choosing" {
         .incoming_window = 50,
         .next_outgoing_id = 0,
         .outgoing_window = 60,
+        .echo = true,
     } }, "");
 
-    var gates = [_]Gate{.{ .at = gate_at, .after_frames = 2 }};
+    var gates = [_]Gate{
+        .{ .at = gate_at, .after_frames = 2 },
+        .{ .at = sink.written().len, .after_frames = 3 },
+    };
     var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
     defer peer.deinit();
     const stream = peer.ready();
@@ -2165,11 +2237,68 @@ test "the peer answers the begin on a channel of its own choosing" {
     try testing.expectEqual(@as(u16, 0), session.channel);
     try testing.expectEqual(@as(?u16, 7), session.remote_channel);
 
-    // The frame that follows on the channel of the peer must reach this
-    // session, and must not end the connection as an unregistered channel.
-    var frame = try session.queue.getOne(io);
-    frame.deinit();
+    // The answer to the echo is the third frame on the wire, so the router task
+    // took the flow that arrived on the channel of the peer.
+    try gates[1].event.wait(io);
     try testing.expect(connection.failure() == null);
+    try testing.expectEqual(@as(u32, 60), session.window.remote_outgoing_window);
+    try testing.expectEqual(@as(u32, 50), session.window.remote_incoming_window);
+
+    // Section 2.5.1: this peer answers on its own outgoing channel, which is
+    // the channel that it sent its begin on.
+    var written: SentFrames = try .parse(gpa, peer.sent());
+    defer written.deinit();
+    const answer = written.find(.flow).?;
+    try testing.expectEqual(@as(u16, 0), answer.channel);
+    try testing.expectEqual(@as(?u32, default_incoming_window), answer.body.?.flow.incoming_window);
+}
+
+test "a flow frame without an incoming window ends the session" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: Storage = try .init(gpa, 4);
+    defer storage.deinit(gpa);
+
+    // Section 2.7.4 makes `incoming-window` mandatory, so this frame is a
+    // protocol error. The router task must end the session and must not unlock
+    // `state_mutex` twice on the way out.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const gate_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
+    try appendFrame(&sink, 0, .{ .flow = .{
+        .next_incoming_id = 0,
+        .next_outgoing_id = 0,
+        .outgoing_window = 5,
+    } }, "");
+
+    var gates = [_]Gate{.{ .at = gate_at, .after_frames = 2 }};
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 4 });
+    defer session.deinit();
+
+    try session.ended.wait(io);
+    const f = session.failure().?;
+    try testing.expectEqual(Error.SessionProtocolError, f.err);
+    try testing.expectEqualStrings(condition.not_allowed, f.condition.?);
+
+    var written: SentFrames = try .parse(gpa, peer.sent());
+    defer written.deinit();
+    const frame = written.find(.end).?;
+    try testing.expectEqualStrings(
+        condition.not_allowed,
+        frame.body.?.end.error_condition.?.condition.?.text,
+    );
 }
 
 test "begin sends one begin frame and records the state of the remote peer" {
@@ -2264,7 +2393,7 @@ test "the end handshake sends one end frame and frees the channel" {
     try connection.registerChannel(0, &other);
 }
 
-test "a begin that the remote peer answers with an end fails" {
+test "a peer that refuses the session ends it with an error" {
     const gpa = testing.allocator;
     const io = testing.io;
     var watchdog = startWatchdog(io);
@@ -2273,10 +2402,15 @@ test "a begin that the remote peer answers with an end fails" {
     var storage: Storage = try .init(gpa, 4);
     defer storage.deinit(gpa);
 
+    // Section 2.5.1 maps the channel with the begin frame, so a peer that
+    // refuses the session answers the begin and then ends it. An end frame on
+    // an unmapped channel reaches no session, and the connection reports a
+    // protocol error for it.
     var sink: Writer.Allocating = .init(gpa);
     defer sink.deinit();
     try scriptOpen(&sink);
     const gate_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
     try appendFrame(&sink, 0, .{ .end = .{ .error_condition = .{
         .condition = .of("amqp:not-allowed"),
         .description = "this container serves no session",
@@ -2290,20 +2424,18 @@ test "a begin that the remote peer answers with an end fails" {
     const connection = try Connection.open(gpa, io, stream, .{});
     defer connection.deinit();
 
-    try testing.expectError(
-        Error.SessionRemoteError,
-        Session.begin(connection, &storage, .{ .incoming_window = 4 }),
-    );
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 4 });
+    defer session.deinit();
+
+    try session.ended.wait(io);
+    const f = session.failure().?;
+    try testing.expectEqual(Error.SessionRemoteError, f.err);
+    try testing.expectEqualStrings("amqp:not-allowed", f.condition.?);
 
     // Section 2.5.2: this peer answered the end frame with its own end frame.
     var written: SentFrames = try .parse(gpa, peer.sent());
     defer written.deinit();
     try testing.expectEqual(@as(usize, 1), written.count(.end));
-
-    // The remote end arrived, so the channel is free again.
-    var buf: [1]Frame = undefined;
-    var other: FrameQueue = .init(&buf);
-    try connection.registerChannel(0, &other);
 }
 
 test "a cancel while the session waits for the remote begin ends the wait" {
@@ -2330,10 +2462,11 @@ test "a cancel while the session waits for the remote begin ends the wait" {
     const connection = try Connection.open(gpa, io, stream, .{});
     defer connection.deinit();
 
-    var beginner: Beginner = .{ .connection = connection, .storage = &storage, .io = io };
-    var task = io.concurrent(Beginner.run, .{&beginner}) catch |err| switch (err) {
+    var beginner: BeginTask = .{ .connection = connection, .storage = &storage };
+    var task = io.concurrent(BeginTask.run, .{&beginner}) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
+    defer beginner.deinit();
 
     try gates[0].event.wait(io);
     task.cancel(io);
@@ -2846,6 +2979,122 @@ test "the session takes the lowest free channel" {
 
     try testing.expectEqual(@as(u16, 1), session.channel);
     try testing.expectEqual(@as(u16, 1), session.remote_channel);
+}
+
+test "two sessions keep their channel numbers apart" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage_one: Storage = try .init(gpa, 4);
+    defer storage_one.deinit(gpa);
+    var storage_two: Storage = try .init(gpa, 4);
+    defer storage_two.deinit(gpa);
+
+    // The first session sends its begin on channel 0, and the second session on
+    // channel 1. The peer answers the first one on its own channel 1, and the
+    // second one on its own channel 0. Section 2.5.1 makes the two namespaces
+    // independent, so each answer arrives on the number that the other session
+    // sends on. One table for both namespaces gives each answer to the wrong
+    // session, and both sessions then end with a protocol error.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const gate_at = sink.written().len;
+    try appendFrame(&sink, 1, remoteBegin(0), "");
+    try appendFrame(&sink, 0, remoteBegin(1), "");
+
+    // The first gate opens when the begin frame of the first session reaches
+    // the wire. The second gate holds the answers back until the begin frame of
+    // the second session follows it, so both sessions hold a channel before any
+    // answer arrives.
+    var gates = [_]Gate{
+        .{ .at = gate_at, .after_frames = 2 },
+        .{ .at = gate_at, .after_frames = 3 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    var first: BeginTask = .{
+        .connection = connection,
+        .storage = &storage_one,
+        .options = .{ .incoming_window = 4 },
+    };
+    var task = io.concurrent(BeginTask.run, .{&first}) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    defer first.deinit();
+
+    // The begin frame of the first session is on the wire, so that session
+    // holds channel 0 and the second session takes channel 1.
+    try gates[0].event.wait(io);
+    const second_result = Session.begin(connection, &storage_two, .{ .incoming_window = 4 });
+    task.await(io);
+
+    const second = try second_result;
+    defer second.deinit();
+
+    try testing.expectEqual(@as(?anyerror, null), first.result);
+    const one = first.session.?;
+    try testing.expectEqual(@as(u16, 0), one.channel);
+    try testing.expectEqual(@as(?u16, 1), one.remote_channel);
+    try testing.expectEqual(@as(u16, 1), second.channel);
+    try testing.expectEqual(@as(?u16, 0), second.remote_channel);
+
+    // Each session took the window of its own answer, and neither one ended.
+    try testing.expectEqual(@as(u32, 100), one.window.remote_incoming_window);
+    try testing.expectEqual(@as(u32, 100), second.window.remote_incoming_window);
+    try testing.expect(one.failure() == null);
+    try testing.expect(second.failure() == null);
+    try testing.expect(connection.failure() == null);
+}
+
+test "a begin answer without a mandatory field gives the channels back" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: Storage = try .init(gpa, 4);
+    defer storage.deinit(gpa);
+
+    // Section 2.7.2 makes `incoming-window` mandatory on a begin frame. The
+    // demultiplexer bound its channel 7 to this session before the session read
+    // the frame, so the failed begin must give both numbers back.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const gate_at = sink.written().len;
+    try appendFrame(&sink, 7, .{ .begin = .{
+        .remote_channel = 0,
+        .next_outgoing_id = 0,
+        .outgoing_window = 100,
+    } }, "");
+
+    var gates = [_]Gate{.{ .at = gate_at, .after_frames = 2 }};
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    try testing.expectError(
+        error.MissingField,
+        Session.begin(connection, &storage, .{ .incoming_window = 4 }),
+    );
+
+    // The channel of this peer is free for the next session.
+    var buf: [1]Frame = undefined;
+    var other: FrameQueue = .init(&buf);
+    try connection.registerChannel(0, &other);
+    // The binding of the channel of the remote peer is gone with it.
+    try testing.expectEqual(@as(u32, 0), connection.remote_channels.count());
 }
 
 test "a queue smaller than the incoming window is refused" {

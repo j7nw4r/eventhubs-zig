@@ -30,9 +30,9 @@
 //! `write_mutex` serializes the frame writes. The demultiplexer never holds it
 //! across a read, so the heartbeat task and a caller never wait for a read.
 //!
-//! `channels_mutex` guards the channel table. Every holder of that lock does a
-//! short table operation and then unlocks. No holder blocks, so no task waits
-//! for a queue while it holds the table.
+//! `channels_mutex` guards the two channel tables. Every holder of that lock
+//! does a short table operation and then unlocks. No holder blocks, so no task
+//! waits for a queue while it holds the table.
 //!
 //! # The frame lifetime
 //!
@@ -69,6 +69,21 @@
 //! A queue can still hold frames after the connection ends, because `get`
 //! gives the buffered elements before it reports `error.Closed`. The owner of
 //! the queue drains it and frees those frames.
+//!
+//! # The two channel namespaces
+//!
+//! Section 2.5.1 gives a session two channel numbers, and the two are
+//! independent. This peer picks the outgoing channel that it sends on, and the
+//! remote peer picks the outgoing channel that it sends on. Each peer names the
+//! channel of the other in the `remote-channel` field of its begin frame.
+//!
+//! One number therefore means two different sessions, so the connection holds
+//! two tables. `registerChannel` writes the outgoing channel of this peer into
+//! `local_channels`, and an answering begin frame reads that table through its
+//! `remote-channel` field. The demultiplexer routes every incoming frame
+//! through `remote_channels`, which the same begin frame binds. A table that
+//! held both namespaces would send the answer of one session to the queue of
+//! another.
 //!
 //! # The write buffer
 //!
@@ -254,10 +269,14 @@ pub const Connection = struct {
     /// True after this peer sent its close frame. `write_mutex` guards it.
     close_sent: bool,
 
-    /// The lock that guards `channels`.
+    /// The lock that guards the two channel tables.
     channels_mutex: Io.Mutex,
-    /// The queue of each channel that a session registered.
-    channels: std.AutoHashMapUnmanaged(u16, *FrameQueue),
+    /// The queue of each outgoing channel of this peer, by channel number.
+    /// The `remote-channel` field of an incoming begin frame reads this table.
+    local_channels: std.AutoHashMapUnmanaged(u16, *FrameQueue),
+    /// The queue of each outgoing channel of the remote peer, by channel
+    /// number. The demultiplexer routes every incoming frame by this table.
+    remote_channels: std.AutoHashMapUnmanaged(u16, *FrameQueue),
 
     /// The step of the terminal state. Read the note on `fail`.
     state: std.atomic.Value(u8),
@@ -340,7 +359,8 @@ pub const Connection = struct {
             .write_dead = false,
             .close_sent = false,
             .channels_mutex = .init,
-            .channels = .empty,
+            .local_channels = .empty,
+            .remote_channels = .empty,
             .state = .init(state_running),
             .failure_err = error.ConnectionClosed,
             .failure_condition = null,
@@ -436,7 +456,8 @@ pub const Connection = struct {
         self.fail(error.ConnectionClosed, null, null);
         self.group.cancel(self.io);
 
-        self.channels.deinit(gpa);
+        self.local_channels.deinit(gpa);
+        self.remote_channels.deinit(gpa);
         gpa.free(self.read_buf);
         gpa.free(self.container_id);
         if (self.remote_container_id) |id| gpa.free(id);
@@ -493,21 +514,33 @@ pub const Connection = struct {
     }
 
     /// Closes every registered queue, so that a blocked reader wakes.
+    ///
+    /// The two tables mostly hold the same pointers. `Io.Queue.close` is
+    /// idempotent, so a queue that both tables name closes one time.
     fn closeChannels(self: *Connection) void {
         // The lock is uncancelable, because a canceled task must still wake
         // the readers of the queues.
         self.channels_mutex.lockUncancelable(self.io);
         defer self.channels_mutex.unlock(self.io);
 
-        var it = self.channels.valueIterator();
-        while (it.next()) |queue| queue.*.close(self.io);
+        var locals = self.local_channels.valueIterator();
+        while (locals.next()) |queue| queue.*.close(self.io);
+        var remotes = self.remote_channels.valueIterator();
+        while (remotes.next()) |queue| queue.*.close(self.io);
     }
 
     // ---------------------------------------------------------------------
-    // The channel table
+    // The channel tables
     // ---------------------------------------------------------------------
 
-    /// Registers the queue that receives the frames of `channel`.
+    /// Registers the queue of a session under the outgoing channel of this
+    /// peer.
+    ///
+    /// The number is the channel that this peer sends on, which section 2.5.1
+    /// makes independent of the channel that the remote peer sends on. The
+    /// answering begin frame of the remote peer names this number in its
+    /// `remote-channel` field, and the demultiplexer then binds the channel
+    /// that the frame arrived on to the same queue.
     ///
     /// The memory of `queue` must stay valid until `deinit` returns, because
     /// the demultiplexer can hold a pointer to it while it pushes a frame.
@@ -521,7 +554,7 @@ pub const Connection = struct {
         try self.channels_mutex.lock(self.io);
         defer self.channels_mutex.unlock(self.io);
 
-        const entry = try self.channels.getOrPut(self.gpa, channel);
+        const entry = try self.local_channels.getOrPut(self.gpa, channel);
         if (entry.found_existing) return error.ChannelInUse;
         entry.value_ptr.* = queue;
 
@@ -531,13 +564,18 @@ pub const Connection = struct {
         // Close the new queue here, or its reader waits for a frame that no
         // task can send.
         if (self.failure()) |f| {
-            _ = self.channels.remove(channel);
+            _ = self.local_channels.remove(channel);
             queue.close(self.io);
             return f.err;
         }
     }
 
-    /// Removes the queue of `channel` and closes it.
+    /// Gives back the channels of one session and closes its queue.
+    ///
+    /// `local` is the channel that this peer sends on, and `remote` is the
+    /// channel that the remote peer sends on, or null while its begin frame
+    /// has not arrived. Both must go, or the demultiplexer keeps routing
+    /// frames to a queue that the session already closed.
     ///
     /// The demultiplexer can still hold the pointer, so the memory of the
     /// queue must stay valid until `deinit` returns.
@@ -548,35 +586,54 @@ pub const Connection = struct {
     /// error. A peer legally keeps frames in flight until its `end` arrives, so
     /// a session must call this only after it read the `end` of the remote
     /// peer.
-    pub fn unregisterChannel(self: *Connection, channel: u16) void {
+    pub fn unregisterChannel(self: *Connection, local: u16, remote: ?u16) void {
         const queue = blk: {
             self.channels_mutex.lockUncancelable(self.io);
             defer self.channels_mutex.unlock(self.io);
-            break :blk self.channels.fetchRemove(channel) orelse return;
+
+            if (remote) |channel| _ = self.remote_channels.remove(channel);
+            const entry = self.local_channels.fetchRemove(local) orelse return;
+            break :blk entry.value;
         };
-        queue.value.close(self.io);
+        queue.close(self.io);
     }
 
-    /// Points `channel` at a queue that a session already registered under its
-    /// own channel number.
+    /// The reasons that `routeChannel` gives no queue.
+    const RouteError = Allocator.Error || error{
+        /// No session owns the channel that the frame arrived on.
+        UnknownChannel,
+    };
+
+    /// Returns the queue that receives the frames of `channel`, and binds the
+    /// channel when an answering begin frame arrives on it.
     ///
-    /// Section 2.5.1 gives a session two channel numbers: the one that this
-    /// peer sends on, and the one that the remote peer sends on. The two are
-    /// independent. This function adds the second one, so both reach one queue.
+    /// `answered` carries the `remote-channel` field of a begin frame, and null
+    /// for every other frame. Section 2.5.1 lets the remote peer answer on any
+    /// outgoing channel of its own and name the channel of this peer in that
+    /// field, so the answer is the frame that binds the two numbers together.
+    /// Every later frame of the session routes by the binding alone.
+    ///
+    /// The call takes `channels_mutex` one time, so no other task can register
+    /// a channel between the lookup and the bind.
     ///
     /// Only the demultiplexer task calls this, so no frame on the new channel
     /// can arrive before the bind finishes.
-    fn bindChannel(self: *Connection, channel: u16, queue: *FrameQueue) Allocator.Error!void {
+    fn routeChannel(self: *Connection, channel: u16, answered: ?u16) RouteError!*FrameQueue {
         self.channels_mutex.lockUncancelable(self.io);
         defer self.channels_mutex.unlock(self.io);
-        try self.channels.put(self.gpa, channel, queue);
-    }
 
-    /// Returns the queue of `channel`, or null when no session registered one.
-    fn lookupChannel(self: *Connection, channel: u16) ?*FrameQueue {
-        self.channels_mutex.lockUncancelable(self.io);
-        defer self.channels_mutex.unlock(self.io);
-        return self.channels.get(channel);
+        if (self.remote_channels.get(channel)) |queue| return queue;
+
+        const local = answered orelse return error.UnknownChannel;
+        const queue = self.local_channels.get(local) orelse return error.UnknownChannel;
+
+        const entry = try self.remote_channels.getOrPut(self.gpa, channel);
+        // The lookup above ran under this same lock, so the key is new. An
+        // insert that replaced a live binding would give the frames of one
+        // session to the queue of another.
+        std.debug.assert(!entry.found_existing);
+        entry.value_ptr.* = queue;
+        return queue;
     }
 
     // ---------------------------------------------------------------------
@@ -774,32 +831,27 @@ pub const Connection = struct {
             else => {},
         }
 
-        const queue = self.lookupChannel(owned.channel) orelse bind: {
-            // Section 2.5.1: a peer answers a begin on a channel of its own
-            // choosing, and it names the channel of this peer in the
-            // `remote-channel` field. The two numbers are independent, so the
-            // answer usually arrives on a channel that no session registered.
-            //
-            // The bind happens in this task, and not in the session, because a
-            // later frame on the new channel would otherwise race the bind.
-            if (body == .begin) {
-                if (body.begin.remote_channel) |local| {
-                    if (self.lookupChannel(local)) |q| {
-                        self.bindChannel(owned.channel, q) catch {
-                            owned.deinit();
-                            self.fail(error.TransportFailure, null, "the channel table ran out of memory");
-                            return .stop;
-                        };
-                        break :bind q;
-                    }
-                }
-            }
+        // Section 2.5.1: a peer answers a begin on an outgoing channel of its
+        // own choosing, and it names the channel of this peer in the
+        // `remote-channel` field. The two numbers are independent, so the
+        // answer usually arrives on a channel that no session registered. The
+        // bind happens in this task, and not in the session, because a later
+        // frame on the new channel would otherwise race the bind.
+        const answered: ?u16 = if (body == .begin) body.begin.remote_channel else null;
+        const queue = self.routeChannel(owned.channel, answered) catch |err| {
             owned.deinit();
-            self.fail(
-                error.ProtocolError,
-                null,
-                "a frame arrived on a channel that no session registered",
-            );
+            switch (err) {
+                error.OutOfMemory => self.fail(
+                    error.TransportFailure,
+                    null,
+                    "the channel table ran out of memory",
+                ),
+                error.UnknownChannel => self.fail(
+                    error.ProtocolError,
+                    null,
+                    "a frame arrived on a channel that no session registered",
+                ),
+            }
             return .stop;
         };
 
@@ -1420,6 +1472,10 @@ test "the demultiplexer routes frames to two separate channels" {
     var watchdog = startWatchdog(io);
     defer stopWatchdog(io, &watchdog);
 
+    // Section 2.5.1: the peer answers on an outgoing channel of its own, and it
+    // names the channel of this peer in the `remote-channel` field. The two
+    // sessions here sent their begin frames on channels 11 and 22, and the peer
+    // answers them on its channels 1 and 2.
     var sink: Writer.Allocating = .init(gpa);
     defer sink.deinit();
     try appendFrame(&sink, 0, .{ .open = .{ .container_id = "the-peer" } }, "");
@@ -1437,8 +1493,8 @@ test "the demultiplexer routes frames to two separate channels" {
     var buf_two: [4]Frame = undefined;
     var queue_one: FrameQueue = .init(&buf_one);
     var queue_two: FrameQueue = .init(&buf_two);
-    try connection.registerChannel(1, &queue_one);
-    try connection.registerChannel(2, &queue_two);
+    try connection.registerChannel(11, &queue_one);
+    try connection.registerChannel(22, &queue_two);
 
     var first = try queue_one.getOne(io);
     defer first.deinit();
@@ -1449,6 +1505,53 @@ test "the demultiplexer routes frames to two separate channels" {
     try testing.expectEqual(@as(?u16, 11), first.body.?.begin.remote_channel);
     try testing.expectEqual(@as(u16, 2), second.channel);
     try testing.expectEqual(@as(?u16, 22), second.body.?.begin.remote_channel);
+}
+
+test "an answering begin binds the channel of the peer and leaves the local table alone" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    // Two sessions hold the outgoing channels 0 and 5 of this peer. The peer
+    // answers the session of channel 0 on its own channel 5, and the session of
+    // channel 5 on its own channel 9. The first answer must reach the first
+    // session, and it must not disturb the registration of the second one: one
+    // table for both namespaces gives that frame to the wrong queue, and an
+    // insert into that table then replaces a live registration.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try appendFrame(&sink, 0, .{ .open = .{ .container_id = "the-peer" } }, "");
+    try appendFrame(&sink, 5, .{ .begin = .{ .remote_channel = 0 } }, "");
+    try appendFrame(&sink, 9, .{ .begin = .{ .remote_channel = 5 } }, "");
+
+    var peer: Peer = .init(gpa, io, sink.written(), .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    var buf_one: [4]Frame = undefined;
+    var buf_two: [4]Frame = undefined;
+    var queue_one: FrameQueue = .init(&buf_one);
+    var queue_two: FrameQueue = .init(&buf_two);
+    try connection.registerChannel(0, &queue_one);
+    try connection.registerChannel(5, &queue_two);
+
+    // The queue of the second session takes the answer that names channel 5,
+    // and not the answer that arrived on channel 5.
+    var second = try queue_two.getOne(io);
+    defer second.deinit();
+    try testing.expectEqual(@as(u16, 9), second.channel);
+    try testing.expectEqual(@as(?u16, 5), second.body.?.begin.remote_channel);
+
+    var first = try queue_one.getOne(io);
+    defer first.deinit();
+    try testing.expectEqual(@as(u16, 5), first.channel);
+    try testing.expectEqual(@as(?u16, 0), first.body.?.begin.remote_channel);
+
+    try testing.expect(connection.failure() == null);
 }
 
 test "a channel accepts one session only" {
@@ -1481,10 +1584,14 @@ test "a queued frame keeps its payload when the next read reuses the buffer" {
     var watchdog = startWatchdog(io);
     defer stopWatchdog(io, &watchdog);
 
+    // The begin frames bind the channels of the peer, and the transfer frames
+    // follow on the same two channels.
     const filler = "F" ** 512;
     var sink: Writer.Allocating = .init(gpa);
     defer sink.deinit();
     try appendFrame(&sink, 0, .{ .open = .{ .container_id = "the-peer" } }, "");
+    try appendFrame(&sink, 1, .{ .begin = .{ .remote_channel = 1 } }, "");
+    try appendFrame(&sink, 2, .{ .begin = .{ .remote_channel = 2 } }, "");
     try appendFrame(&sink, 1, .{ .transfer = .{ .handle = 0 } }, "the-message");
     try appendFrame(&sink, 2, .{ .transfer = .{ .handle = 1 } }, filler);
 
@@ -1502,7 +1609,12 @@ test "a queued frame keeps its payload when the next read reuses the buffer" {
     try connection.registerChannel(1, &queue_one);
     try connection.registerChannel(2, &queue_two);
 
-    // The second frame arrives only after the demultiplexer read it into the
+    var begin_one = try queue_one.getOne(io);
+    begin_one.deinit();
+    var begin_two = try queue_two.getOne(io);
+    begin_two.deinit();
+
+    // The second transfer arrives only after the demultiplexer read it into the
     // one buffer that it owns, so the buffer no longer holds the first
     // payload.
     var second = try queue_two.getOne(io);
@@ -1523,7 +1635,7 @@ test "a socket failure wakes a blocked reader with the remote condition" {
     var sink: Writer.Allocating = .init(gpa);
     defer sink.deinit();
     try appendFrame(&sink, 0, .{ .open = .{ .container_id = "the-peer" } }, "");
-    try appendFrame(&sink, 1, .{ .begin = .{ .remote_channel = 11 } }, "");
+    try appendFrame(&sink, 1, .{ .begin = .{ .remote_channel = 1 } }, "");
     const gate_at = sink.written().len;
     try appendFrame(&sink, 0, .{ .close = .{ .error_condition = .{
         .condition = .of("amqp:internal-error"),
@@ -1611,7 +1723,7 @@ test "a truncated stream ends the connection with a transport failure" {
     defer sink.deinit();
     try appendFrame(&sink, 0, .{ .open = .{ .container_id = "the-peer" } }, "");
     const gate_at = sink.written().len;
-    try appendFrame(&sink, 1, .{ .begin = .{ .remote_channel = 11 } }, "");
+    try appendFrame(&sink, 1, .{ .begin = .{ .remote_channel = 1 } }, "");
 
     // The peer cuts the stream in the middle of the second frame.
     const script = try gpa.dupe(u8, sink.written()[0 .. sink.written().len - 3]);
@@ -1826,7 +1938,7 @@ test "unregisterChannel closes the queue and stops the routing" {
     var buf: [1]Frame = undefined;
     var queue: FrameQueue = .init(&buf);
     try connection.registerChannel(4, &queue);
-    connection.unregisterChannel(4);
+    connection.unregisterChannel(4, null);
 
     try testing.expectError(error.Closed, queue.getOne(io));
     // The channel is free again, and the connection still runs.
