@@ -530,7 +530,6 @@ pub const Session = struct {
 
     /// The outgoing channel number of this endpoint.
     channel: u16,
-    /// The channel that the begin frame of the remote peer named.
     /// The channel that the remote peer sends on, or null until its begin
     /// arrives. Section 2.5.1 makes it independent of `channel`.
     remote_channel: ?u16,
@@ -636,12 +635,13 @@ pub const Session = struct {
         };
 
         self.channel = try takeChannel(connection, &storage.queue, options.channel);
-        // Every path below this point owns a registered channel. A failed begin
-        // closes the queue and leaves it registered, unless it read the end
-        // frame of the remote peer: the demultiplexer then drops the later
-        // frames of the channel instead of ending the connection with a
-        // protocol error, which it would do for a frame on a channel that no
-        // session registered.
+        // Every path below this point owns a registered channel. A begin that
+        // fails before the answer of the remote peer arrives closes the queue
+        // and leaves the channel registered, so the demultiplexer drops the
+        // later frames of the channel instead of ending the connection with a
+        // protocol error. A begin that fails after the answer arrives gives
+        // both channels back, because `readRemoteBegin` sends an end frame on
+        // every one of those paths.
         errdefer closeAndDrain(io, &storage.queue);
 
         try connection.send(self.channel, .{ .begin = .{
@@ -694,7 +694,25 @@ pub const Session = struct {
     /// arrives. Both must go, or the demultiplexer keeps routing frames to a
     /// queue that this session already closed.
     fn releaseChannels(self: *Session) void {
-        self.connection.unregisterChannel(self.channel, self.remote_channel);
+        self.connection.unregisterChannel(self.channel);
+    }
+
+    /// Gives the channels back one time, after the end frame of the remote peer
+    /// arrived.
+    ///
+    /// Section 2.5.2 note (2) disassociates the session from the incoming
+    /// channel at that moment, and section 2.5.1 recommends the lowest free
+    /// number, so the remote peer puts the number back to work at once. A
+    /// session that held the binding until `end` or `deinit` would take the
+    /// answer that belongs to the next session of the peer, and that session
+    /// would then wait for a frame that cannot arrive.
+    ///
+    /// `unregistered` is a plain bool, because the router task writes it and
+    /// `end` and `deinit` read it only after `stopRouter` joined that task.
+    fn releaseChannelsOnce(self: *Session) void {
+        if (self.unregistered) return;
+        self.unregistered = true;
+        self.releaseChannels();
     }
 
     /// Reads frames until the begin frame of the remote peer arrives.
@@ -734,12 +752,20 @@ pub const Session = struct {
                                 .condition = .of(condition.illegal_state),
                                 .description = "the begin frame answered another channel",
                             }) catch {};
-                            self.connection.unregisterChannel(self.channel, frame.channel);
+                            self.releaseChannelsOnce();
                             return error.SessionProtocolError;
                         }
                     }
                     self.window.receiveBegin(remote) catch {
-                        self.connection.unregisterChannel(self.channel, frame.channel);
+                        // Section 2.5.4: a session that cannot process input
+                        // "MUST indicate this by issuing an END with an
+                        // appropriate error". The session is mapped here,
+                        // because the answer of the remote peer arrived.
+                        self.sendEndUncancelable(.{
+                            .condition = .of(condition.not_allowed),
+                            .description = "the begin frame left out a mandatory field",
+                        }) catch {};
+                        self.releaseChannelsOnce();
                         return error.MissingField;
                     };
                     self.remote_channel = frame.channel;
@@ -751,7 +777,7 @@ pub const Session = struct {
                     // is free again.
                     self.sendEndUncancelable(null) catch {};
                     self.remote_end_seen.store(true, .release);
-                    self.connection.unregisterChannel(self.channel, frame.channel);
+                    self.releaseChannelsOnce();
                     if (remote.error_condition == null) return error.SessionEnded;
                     return error.SessionRemoteError;
                 },
@@ -760,7 +786,7 @@ pub const Session = struct {
                         .condition = .of(condition.illegal_state),
                         .description = "a frame arrived before the begin frame",
                     }) catch {};
-                    self.connection.unregisterChannel(self.channel, frame.channel);
+                    self.releaseChannelsOnce();
                     return error.SessionProtocolError;
                 },
             }
@@ -790,11 +816,9 @@ pub const Session = struct {
         // Section 2.5.2 frees the channel when the end frame of the remote peer
         // arrives, and not before. A peer keeps frames in flight until then,
         // and the connection ends with a protocol error for a frame on a
-        // channel that no session registered.
-        if (self.remote_end_seen.load(.acquire) and !self.unregistered) {
-            self.unregistered = true;
-            self.releaseChannels();
-        }
+        // channel that no session registered. The router task frees the
+        // channels at that moment, so this call normally finds them gone.
+        if (self.remote_end_seen.load(.acquire)) self.releaseChannelsOnce();
 
         drainQueue(self.io, self.queue);
 
@@ -1107,11 +1131,8 @@ pub const Session = struct {
         self.stopRouter();
 
         // Section 2.5.2 frees the channel only when the end frame of the remote
-        // peer arrived.
-        if (self.remote_end_seen.load(.acquire) and !self.unregistered) {
-            self.unregistered = true;
-            self.releaseChannels();
-        }
+        // peer arrived. The router task normally did that already.
+        if (self.remote_end_seen.load(.acquire)) self.releaseChannelsOnce();
 
         if (timed_out) return error.Timeout;
 
@@ -1178,6 +1199,9 @@ pub const Session = struct {
             owned.deinit();
             if (!is_end) return .keep_reading;
             self.remote_end_seen.store(true, .release);
+            // Section 2.5.4 ends the discarding state here, and section 2.5.2
+            // note (2) frees the channels with it.
+            self.releaseChannelsOnce();
             return .stop;
         }
 
@@ -1246,6 +1270,10 @@ pub const Session = struct {
         self.remote_end_seen.store(true, .release);
         // Section 2.5.2: a peer answers an end frame with an end frame.
         self.sendEndBestEffort(null);
+        // The handshake is over, so both channel numbers go back now. The
+        // caller can hold this session for as long as it wants, and the remote
+        // peer can begin its next session on the same number at once.
+        self.releaseChannelsOnce();
 
         const condition_error = performative.error_condition orelse {
             self.fail(error.SessionEnded, null, null);
@@ -1813,6 +1841,18 @@ const Peer = struct {
 fn watchdogRun(io: Io, seconds: i64) void {
     io.sleep(.fromSeconds(seconds), .awake) catch return;
     std.debug.panic("the test did not finish within {d} seconds", .{seconds});
+}
+
+/// Waits until the router task of a session reads the end frame of the remote
+/// peer.
+///
+/// The router task gives the channels back at that moment, and it writes no
+/// frame for a session that already sent its own end, so this flag is the only
+/// signal that the moment passed. The watchdog bounds the wait.
+fn waitRemoteEnd(io: Io, session: *Session) !void {
+    while (!session.remote_end_seen.load(.acquire)) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
 }
 
 fn startWatchdog(io: Io) ?Io.Future(void) {
@@ -3054,6 +3094,173 @@ test "two sessions keep their channel numbers apart" {
     try testing.expect(connection.failure() == null);
 }
 
+test "a session begins after the peer reuses the channel of an ended session" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage_one: Storage = try .init(gpa, 4);
+    defer storage_one.deinit(gpa);
+    var storage_two: Storage = try .init(gpa, 4);
+    defer storage_two.deinit(gpa);
+
+    // The first session begins on channel 0, and the peer answers on its
+    // channel 5 and then ends the session with an error. Section 2.5.2 note (2)
+    // frees both numbers at that point, and section 2.5.1 recommends the lowest
+    // free number, so the peer answers the second session on channel 5 again.
+    // A binding that outlived the first session would take that answer, and the
+    // second session would wait for it forever.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const first_at = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+    try appendFrame(&sink, 5, .{ .end = .{ .error_condition = .{
+        .condition = .of("amqp:internal-error"),
+        .description = "the broker lost the session",
+    } } }, "");
+    const second_at = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+
+    // The frames of this peer are the open, the begin of the first session, the
+    // end that answers the peer, and the begin of the second session.
+    var gates = [_]Gate{
+        .{ .at = first_at, .after_frames = 2 },
+        .{ .at = second_at, .after_frames = 4 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const first = try Session.begin(connection, &storage_one, .{ .incoming_window = 4 });
+    defer first.deinit();
+
+    // The router task of the first session read the end frame of the peer, so
+    // the session ended and gave both numbers back. The caller still holds it.
+    try first.ended.wait(io);
+    try testing.expectEqual(Error.SessionRemoteError, first.failure().?.err);
+
+    const second = try Session.begin(connection, &storage_two, .{ .incoming_window = 4 });
+    defer second.deinit();
+
+    // The lowest free channel is 0 again, and the answer of the peer on its
+    // channel 5 reaches the new session.
+    try testing.expectEqual(@as(u16, 0), second.channel);
+    try testing.expectEqual(@as(?u16, 5), second.remote_channel);
+    try testing.expectEqual(@as(u32, 100), second.window.remote_incoming_window);
+    try testing.expect(second.failure() == null);
+    try testing.expect(connection.failure() == null);
+}
+
+test "a discarding session frees its channels when the end of the peer arrives" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage_one: Storage = try .init(gpa, 4);
+    defer storage_one.deinit(gpa);
+    var storage_two: Storage = try .init(gpa, 4);
+    defer storage_two.deinit(gpa);
+
+    // The peer names a handle that no link uses, so the first session ends the
+    // session with an error and discards frames until the end frame of the peer
+    // arrives. Section 2.5.4 ends the discarding state there, and the numbers
+    // must go back at that point too.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const first_at = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+    try appendFrame(&sink, 5, .{ .flow = .{
+        .next_incoming_id = 0,
+        .incoming_window = 5,
+        .next_outgoing_id = 0,
+        .outgoing_window = 5,
+        .handle = 9,
+    } }, "");
+    const end_at = sink.written().len;
+    try appendFrame(&sink, 5, .{ .end = .{} }, "");
+    const second_at = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+
+    // The frames of this peer are the open, the begin of the first session, the
+    // end that reports the bad handle, and the begin of the second session.
+    var gates = [_]Gate{
+        .{ .at = first_at, .after_frames = 2 },
+        .{ .at = end_at, .after_frames = 3 },
+        .{ .at = second_at, .after_frames = 4 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const first = try Session.begin(connection, &storage_one, .{ .incoming_window = 4 });
+    defer first.deinit();
+
+    try first.ended.wait(io);
+    try testing.expectEqualStrings(condition.unattached_handle, first.failure().?.condition.?);
+    try waitRemoteEnd(io, first);
+
+    // The peer reuses its channel 5 for the next session, and the answer
+    // reaches that session.
+    const second = try Session.begin(connection, &storage_two, .{ .incoming_window = 4 });
+    defer second.deinit();
+
+    try testing.expectEqual(@as(u16, 0), second.channel);
+    try testing.expectEqual(@as(?u16, 5), second.remote_channel);
+    try testing.expect(connection.failure() == null);
+}
+
+test "a second answering begin binds no second channel" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: Storage = try .init(gpa, 4);
+    defer storage.deinit(gpa);
+
+    // A broken peer answers the same session two times, on two channels of its
+    // own. Section 2.5.1 gives the session one channel of the peer, so the
+    // second answer binds nothing. A second binding would outlive the session,
+    // because the release path knows one number alone.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const gate_at = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+    try appendFrame(&sink, 7, remoteBegin(0), "");
+
+    var gates = [_]Gate{.{ .at = gate_at, .after_frames = 2 }};
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 4 });
+    defer session.deinit();
+
+    try testing.expectEqual(@as(?u16, 5), session.remote_channel);
+
+    // The second answer reaches the session, which reports it as a second begin
+    // frame on the channel.
+    try session.ended.wait(io);
+    const f = session.failure().?;
+    try testing.expectEqual(Error.SessionProtocolError, f.err);
+    try testing.expectEqualStrings(condition.illegal_state, f.condition.?);
+    try testing.expectEqual(@as(u32, 1), connection.remote_channels.count());
+}
+
 test "a begin answer without a mandatory field gives the channels back" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -3087,6 +3294,17 @@ test "a begin answer without a mandatory field gives the channels back" {
     try testing.expectError(
         error.MissingField,
         Session.begin(connection, &storage, .{ .incoming_window = 4 }),
+    );
+
+    // Section 2.5.4: the session was mapped, so it must report the fault with
+    // an end frame before it goes.
+    var written: SentFrames = try .parse(gpa, peer.sent());
+    defer written.deinit();
+    const frame = written.find(.end).?;
+    try testing.expectEqual(@as(u16, 0), frame.channel);
+    try testing.expectEqualStrings(
+        condition.not_allowed,
+        frame.body.?.end.error_condition.?.condition.?.text,
     );
 
     // The channel of this peer is free for the next session.

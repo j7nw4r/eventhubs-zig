@@ -85,6 +85,11 @@
 //! held both namespaces would send the answer of one session to the queue of
 //! another.
 //!
+//! Each entry of `local_channels` carries the number that it bound, so
+//! `unregisterChannel` takes one number and removes both. A session gets one
+//! channel of the remote peer, and a second answer for the same session binds
+//! nothing.
+//!
 //! # The write buffer
 //!
 //! Every write path writes one frame and then flushes. The flush puts the
@@ -229,6 +234,20 @@ pub const Options = struct {
 };
 
 // -------------------------------------------------------------------------
+// The channel registration
+// -------------------------------------------------------------------------
+
+/// The registration of one session, under the outgoing channel of this peer.
+const ChannelEntry = struct {
+    /// The queue that receives the frames of the session.
+    queue: *FrameQueue,
+    /// The outgoing channel of the remote peer, or null until its begin frame
+    /// arrives. Section 2.5.1 makes the two numbers independent, and the
+    /// answering begin frame binds them together.
+    remote: ?u16,
+};
+
+// -------------------------------------------------------------------------
 // The connection
 // -------------------------------------------------------------------------
 
@@ -271,9 +290,10 @@ pub const Connection = struct {
 
     /// The lock that guards the two channel tables.
     channels_mutex: Io.Mutex,
-    /// The queue of each outgoing channel of this peer, by channel number.
-    /// The `remote-channel` field of an incoming begin frame reads this table.
-    local_channels: std.AutoHashMapUnmanaged(u16, *FrameQueue),
+    /// The registration of each outgoing channel of this peer, by channel
+    /// number. The `remote-channel` field of an incoming begin frame reads
+    /// this table.
+    local_channels: std.AutoHashMapUnmanaged(u16, ChannelEntry),
     /// The queue of each outgoing channel of the remote peer, by channel
     /// number. The demultiplexer routes every incoming frame by this table.
     remote_channels: std.AutoHashMapUnmanaged(u16, *FrameQueue),
@@ -524,7 +544,7 @@ pub const Connection = struct {
         defer self.channels_mutex.unlock(self.io);
 
         var locals = self.local_channels.valueIterator();
-        while (locals.next()) |queue| queue.*.close(self.io);
+        while (locals.next()) |entry| entry.queue.close(self.io);
         var remotes = self.remote_channels.valueIterator();
         while (remotes.next()) |queue| queue.*.close(self.io);
     }
@@ -556,7 +576,7 @@ pub const Connection = struct {
 
         const entry = try self.local_channels.getOrPut(self.gpa, channel);
         if (entry.found_existing) return error.ChannelInUse;
-        entry.value_ptr.* = queue;
+        entry.value_ptr.* = .{ .queue = queue, .remote = null };
 
         // The connection can end between the test above and this insert.
         // `fail` publishes the reason before it closes the queues, and it
@@ -570,12 +590,13 @@ pub const Connection = struct {
         }
     }
 
-    /// Gives back the channels of one session and closes its queue.
+    /// Gives back both channels of one session and closes its queue.
     ///
-    /// `local` is the channel that this peer sends on, and `remote` is the
-    /// channel that the remote peer sends on, or null while its begin frame
-    /// has not arrived. Both must go, or the demultiplexer keeps routing
-    /// frames to a queue that the session already closed.
+    /// `local` is the channel that this peer sends on. The entry carries the
+    /// channel that the remote peer sends on, and this call removes that
+    /// binding with it. Both must go, or the demultiplexer keeps routing
+    /// frames to a queue that the session already closed, and a later session
+    /// of the peer on the same number never reaches its own queue.
     ///
     /// The demultiplexer can still hold the pointer, so the memory of the
     /// queue must stay valid until `deinit` returns.
@@ -586,14 +607,14 @@ pub const Connection = struct {
     /// error. A peer legally keeps frames in flight until its `end` arrives, so
     /// a session must call this only after it read the `end` of the remote
     /// peer.
-    pub fn unregisterChannel(self: *Connection, local: u16, remote: ?u16) void {
+    pub fn unregisterChannel(self: *Connection, local: u16) void {
         const queue = blk: {
             self.channels_mutex.lockUncancelable(self.io);
             defer self.channels_mutex.unlock(self.io);
 
-            if (remote) |channel| _ = self.remote_channels.remove(channel);
             const entry = self.local_channels.fetchRemove(local) orelse return;
-            break :blk entry.value;
+            if (entry.value.remote) |channel| _ = self.remote_channels.remove(channel);
+            break :blk entry.value.queue;
         };
         queue.close(self.io);
     }
@@ -625,15 +646,23 @@ pub const Connection = struct {
         if (self.remote_channels.get(channel)) |queue| return queue;
 
         const local = answered orelse return error.UnknownChannel;
-        const queue = self.local_channels.get(local) orelse return error.UnknownChannel;
+        const entry = self.local_channels.getPtr(local) orelse return error.UnknownChannel;
 
-        const entry = try self.remote_channels.getOrPut(self.gpa, channel);
+        // Section 2.5.1 gives a session one channel of the remote peer. A
+        // second answer for the same session binds nothing, because the
+        // binding that no release path knows about would outlive the session
+        // and take the answer of a later one. The frame still reaches the
+        // session, which reports the second begin frame itself.
+        if (entry.remote != null) return entry.queue;
+
+        const bound = try self.remote_channels.getOrPut(self.gpa, channel);
         // The lookup above ran under this same lock, so the key is new. An
         // insert that replaced a live binding would give the frames of one
         // session to the queue of another.
-        std.debug.assert(!entry.found_existing);
-        entry.value_ptr.* = queue;
-        return queue;
+        std.debug.assert(!bound.found_existing);
+        bound.value_ptr.* = entry.queue;
+        entry.remote = channel;
+        return entry.queue;
     }
 
     // ---------------------------------------------------------------------
@@ -1938,7 +1967,7 @@ test "unregisterChannel closes the queue and stops the routing" {
     var buf: [1]Frame = undefined;
     var queue: FrameQueue = .init(&buf);
     try connection.registerChannel(4, &queue);
-    connection.unregisterChannel(4, null);
+    connection.unregisterChannel(4);
 
     try testing.expectError(error.Closed, queue.getOne(io));
     // The channel is free again, and the connection still runs.
