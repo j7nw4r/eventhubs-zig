@@ -3608,3 +3608,77 @@ test "an echo flow that crosses the local end draws no frame after the end" {
     }
     try testing.expectEqual(@as(usize, 0), after_end);
 }
+
+test "transfers that cross the local end draw no replenish flow after the end" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: Storage = try .init(gpa, 4);
+    defer storage.deinit(gpa);
+
+    var link_buf: [8]Frame = undefined;
+    var link_queue: FrameQueue = .init(&link_buf);
+
+    // This peer calls end. Three transfers from the remote peer cross that end
+    // frame on the wire and pull the window below half. Section 2.5.5 puts
+    // this endpoint in END_SENT, where it "MAY receive frames, but cannot
+    // send them", so the replenish flow must not go out after the end frame.
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 5, remoteBegin(0), "");
+    const attach_at = sink.written().len;
+    try appendFrame(&sink, 5, .{ .attach = .{
+        .name = "the-link",
+        .handle = 3,
+        .role = .sender,
+    } }, "");
+    try appendFrame(&sink, 5, .{ .transfer = .{ .handle = 3 } }, "a");
+    try appendFrame(&sink, 5, .{ .transfer = .{ .handle = 3 } }, "b");
+    try appendFrame(&sink, 5, .{ .transfer = .{ .handle = 3 } }, "c");
+    try appendFrame(&sink, 5, .{ .end = .{} }, "");
+
+    // Frame 3 of this peer is its end frame. The transfers of the remote peer
+    // arrive after it, which models the crossing.
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = attach_at, .after_frames = 3 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 4 });
+    defer session.deinit();
+
+    _ = try session.attachLink("the-link", &link_queue);
+
+    try session.end(null);
+    drainQueue(io, &link_queue);
+
+    // The window moved for the three transfers, so the accounting stayed
+    // correct for the frames that still arrived.
+    try testing.expectEqual(@as(u32, 1), session.window.incoming_window);
+
+    var written: SentFrames = try .parse(gpa, peer.sent());
+    defer written.deinit();
+
+    // Walk the wire in order. No session frame comes after the end frame.
+    var end_seen = false;
+    var after_end: usize = 0;
+    for (written.frames.items) |frame| {
+        const body = frame.body orelse continue;
+        if (body == .end) {
+            end_seen = true;
+            continue;
+        }
+        if (end_seen) after_end += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), after_end);
+}
