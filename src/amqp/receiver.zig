@@ -661,6 +661,10 @@ pub const Receiver = struct {
     /// Reports the released outcome of section 3.4.4 for one delivery. The
     /// receiver made no judgement about the message.
     ///
+    /// The call sends nothing when `Options.auto_accept` is on, because the
+    /// router task already accepted the delivery. Turn that option off to
+    /// choose the outcome.
+    ///
     /// The call does not free `delivery`. Free it with `Delivery.deinit`.
     pub fn release(self: *Receiver, delivery: Delivery) DispositionError!void {
         return self.dispose(delivery, .{ .released = .{} });
@@ -670,6 +674,10 @@ pub const Receiver = struct {
     ///
     /// The caller owns every slice of `error_condition`, and the slices must
     /// live until this call returns.
+    ///
+    /// The call sends nothing when `Options.auto_accept` is on, because the
+    /// router task already accepted the delivery. Turn that option off to
+    /// choose the outcome.
     ///
     /// The call does not free `delivery`. Free it with `Delivery.deinit`.
     pub fn reject(
@@ -687,6 +695,10 @@ pub const Receiver = struct {
     ///
     /// The caller owns every slice of `options`, and the slices must live until
     /// this call returns.
+    ///
+    /// The call sends nothing when `Options.auto_accept` is on, because the
+    /// router task already accepted the delivery. Turn that option off to
+    /// choose the outcome.
     ///
     /// The call does not free `delivery`. Free it with `Delivery.deinit`.
     pub fn modify(

@@ -696,7 +696,16 @@ pub const Link = struct {
                 .condition = .of(failure_condition),
                 .description = description,
             },
-        }) catch {};
+        }) catch |send_err| switch (send_err) {
+            // The send takes `state_mutex` of the session and then the write
+            // lock of the connection, and both are cancelation points. A
+            // cancel signal fires one time, so a cancel that stopped here
+            // would vanish and the router task would park in `getOne` on a
+            // queue that only `deinit` closes. `detach` cancels the group and
+            // then waits for that task, so it would wait forever.
+            error.Canceled => self.io.recancel(),
+            else => {},
+        };
     }
 
     /// Writes the detach frame one time.
