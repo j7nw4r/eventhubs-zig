@@ -989,8 +989,19 @@ pub const Session = struct {
     /// Use it for an `attach`, a `detach`, or a `disposition`. Section 2.5.6
     /// moves no window for those frames. Use `sendTransfer` for a transfer and
     /// `sendFlow` for a flow.
+    ///
+    /// The call takes `state_mutex`, because section 2.5.5 puts an endpoint
+    /// that sent its end frame in END-SENT, where it "MAY receive frames, but
+    /// cannot send them". A caller that races `end` must get an error, and not
+    /// put an attach or a detach on the wire after the end frame.
     pub fn send(self: *Session, body: framing.Body, payload: []const u8) SendError!void {
         if (self.failure()) |f| return f.err;
+
+        try self.state_mutex.lock(self.io);
+        defer self.state_mutex.unlock(self.io);
+
+        if (self.failure()) |f| return f.err;
+        if (self.end_sent) return error.SessionEnded;
         return self.connection.send(self.channel, body, payload);
     }
 
@@ -1006,6 +1017,41 @@ pub const Session = struct {
         performative: performatives.Transfer,
         payload: []const u8,
     ) TransferError!void {
+        _ = try self.sendTransferLocked(performative, payload, false);
+    }
+
+    /// Sends the first transfer frame of a delivery, and returns the delivery
+    /// id that the session gave it.
+    ///
+    /// Section 2.6 gives each message "a unique delivery-id from a session
+    /// scoped sequence", and section 2.6.12 puts the assignment at the
+    /// session, so a link does not choose the value. This session takes the
+    /// transfer id of section 2.5.6 for the delivery id of the first frame of
+    /// the delivery, which gives one value for each delivery, in the order of
+    /// the frames on the wire, and it needs no second counter.
+    ///
+    /// The call writes the id while it holds `state_mutex`, so two links on
+    /// one session never take the same id.
+    ///
+    /// Section 2.7.5 puts the delivery id on the first transfer frame of a
+    /// delivery alone. Send every later frame of the same delivery with
+    /// `sendTransfer`.
+    pub fn sendFirstTransfer(
+        self: *Session,
+        performative: performatives.Transfer,
+        payload: []const u8,
+    ) TransferError!u32 {
+        return self.sendTransferLocked(performative, payload, true);
+    }
+
+    /// Writes one transfer frame. It stamps the delivery id when `stamp_id` is
+    /// true, and it returns the id that the frame carries.
+    fn sendTransferLocked(
+        self: *Session,
+        performative: performatives.Transfer,
+        payload: []const u8,
+        stamp_id: bool,
+    ) TransferError!u32 {
         if (self.failure()) |f| return f.err;
 
         try self.state_mutex.lock(self.io);
@@ -1017,8 +1063,12 @@ pub const Session = struct {
         if (self.end_sent) return error.SessionEnded;
         if (!self.window.canSendTransfer()) return error.RemoteWindowClosed;
 
-        try self.connection.send(self.channel, .{ .transfer = performative }, payload);
+        var body = performative;
+        if (stamp_id) body.delivery_id = self.window.next_outgoing_id;
+
+        try self.connection.send(self.channel, .{ .transfer = body }, payload);
         self.window.sendTransfer();
+        return body.delivery_id orelse 0;
     }
 
     /// Sends one flow frame that carries the session state, and the link state
@@ -3681,4 +3731,61 @@ test "transfers that cross the local end draw no replenish flow after the end" {
         if (end_seen) after_end += 1;
     }
     try testing.expectEqual(@as(usize, 0), after_end);
+}
+
+test "a frame that a caller sends after the local end never reaches the wire" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: Storage = try .init(gpa, 4);
+    defer storage.deinit(gpa);
+
+    var link_buf: [4]Frame = undefined;
+    var link_queue: FrameQueue = .init(&link_buf);
+
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
+
+    var gates = [_]Gate{.{ .at = begin_at, .after_frames = 2 }};
+    var peer: Peer = .init(gpa, io, sink.written(), &gates, .wait);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 4 });
+    defer session.deinit();
+
+    const handle = try session.attachLink("the-link", &link_queue);
+
+    // Section 2.5.5 puts an endpoint that sent its end frame in END_SENT,
+    // where it "MAY receive frames, but cannot send them". A link that races
+    // the end handshake must get an error, and not put an attach or a detach
+    // on the wire after the end frame. The flag stands in for the moment
+    // between the write of the end frame and the answer of the remote peer,
+    // when the session still reports no failure.
+    session.state_mutex.lockUncancelable(io);
+    session.end_sent = true;
+    session.state_mutex.unlock(io);
+
+    try testing.expectEqual(@as(?Failure, null), session.failure());
+    try testing.expectError(error.SessionEnded, session.send(.{ .attach = .{
+        .name = "the-link",
+        .handle = handle,
+        .role = .sender,
+    } }, ""));
+    try testing.expectError(error.SessionEnded, session.send(.{ .detach = .{
+        .handle = handle,
+    } }, ""));
+
+    var written: SentFrames = try .parse(gpa, peer.sent());
+    defer written.deinit();
+    try testing.expectEqual(@as(usize, 0), written.count(.attach));
+    try testing.expectEqual(@as(usize, 0), written.count(.detach));
 }

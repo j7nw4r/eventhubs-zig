@@ -38,6 +38,14 @@ pub const connection = @import("connection.zig");
 /// of the link frames by handle, and the end handshake.
 pub const session = @import("session.zig");
 
+/// The shared link plumbing: the attach handshake, the detach handshake, and
+/// the terminal state of a link.
+pub const link = @import("link.zig");
+
+/// The sending link endpoint: the credit of section 2.6.7, the transfer frames
+/// of section 2.7.5, and the outcome of a delivery.
+pub const sender = @import("sender.zig");
+
 /// One AMQP 1.0 value. The decoder allocates it, and `Value.deinit` frees it.
 pub const Value = types.Value;
 
@@ -188,6 +196,43 @@ pub const LinkFlow = session.LinkFlow;
 /// The error condition symbols that the session layer sends.
 pub const session_condition = session.condition;
 
+/// One link endpoint, without the state that its role adds.
+pub const Link = link.Link;
+
+/// The arguments that the attach frame of every link carries.
+pub const LinkOptions = link.Options;
+
+/// The frame queue of one link, and the memory that holds it.
+pub const LinkStorage = link.Storage;
+
+/// The reason that a link ended, with the condition symbol and the description
+/// text that came with it.
+pub const LinkFailure = link.Failure;
+
+/// The reasons that a link ends.
+pub const LinkError = link.Error;
+
+/// The arguments of a local detach.
+pub const DetachOptions = link.DetachOptions;
+
+/// The fields of the attach frame of the remote peer that a caller reads.
+pub const RemoteLink = link.Remote;
+
+/// One sending link endpoint.
+pub const Sender = sender.Sender;
+
+/// The arguments of `Sender.attach`.
+pub const SenderOptions = sender.Options;
+
+/// The arguments of `Sender.send` that are not the payload.
+pub const SendOptions = sender.SendOptions;
+
+/// The terminal state that the receiver reported for one delivery.
+pub const Outcome = sender.Outcome;
+
+/// The result of one `Sender.send`.
+pub const SendResult = sender.Result;
+
 /// The version of the AMQP specification that this library speaks.
 pub const protocol_version = "1.0";
 
@@ -205,4 +250,6 @@ test {
     _ = transport;
     _ = connection;
     _ = session;
+    _ = link;
+    _ = sender;
 }
