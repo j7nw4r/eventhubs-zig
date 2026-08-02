@@ -668,6 +668,37 @@ pub const Link = struct {
         return f.err;
     }
 
+    /// Ends the link with a reason, and tells the remote peer why.
+    ///
+    /// Section 2.6.5: "When an error occurs at a link endpoint, the endpoint
+    /// MUST be detached with appropriate error information supplied in the
+    /// error field of the detach frame." A link that only failed here would
+    /// leave the remote peer with the link still attached and no reason for
+    /// the silence.
+    ///
+    /// The call sends the frame and does not wait for the answer, so the
+    /// router task can call it on itself. `sendDetach` writes one frame only,
+    /// so a later `detach` adds none. The send is best effort: a session that
+    /// already ended reports the failure to the caller of the link instead.
+    ///
+    /// The caller owns `failure_condition` and `description`, and both must
+    /// live until this call returns.
+    pub fn failAndDetach(
+        self: *Link,
+        err: Error,
+        failure_condition: []const u8,
+        description: ?[]const u8,
+    ) void {
+        self.fail(err, failure_condition, description);
+        self.sendDetach(.{
+            .closed = true,
+            .error_condition = .{
+                .condition = .of(failure_condition),
+                .description = description,
+            },
+        }) catch {};
+    }
+
     /// Writes the detach frame one time.
     fn sendDetach(self: *Link, options: DetachOptions) SendError!void {
         if (self.detach_sent.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;

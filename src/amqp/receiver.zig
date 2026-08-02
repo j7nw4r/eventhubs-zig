@@ -198,9 +198,25 @@ pub const Options = struct {
     /// The largest message that this endpoint accepts, in octets. Section 2.7.3
     /// makes a larger delivery a `message-size-exceeded` link error, and this
     /// module ends the link with that condition when a delivery passes the
-    /// limit. A null value sets no limit.
+    /// limit.
+    ///
+    /// A null value sets no limit. A zero sets no limit either, because
+    /// section 2.7.3 reads the field that way: "If this field is zero or
+    /// unset, there is no maximum size imposed". A zero that meant a limit of
+    /// zero would refuse every payload while the attach frame told the remote
+    /// peer that no limit exists.
     max_message_size: ?u64 = null,
 };
+
+/// Reads a maximum message size of zero as no limit.
+///
+/// Section 2.7.3: "If this field is zero or unset, there is no maximum size
+/// imposed". `Link.maxMessageSize` folds the value of the remote peer the same
+/// way, so both ends of the field read one rule.
+fn foldSizeLimit(limit: ?u64) ?u64 {
+    const value = limit orelse return null;
+    return if (value == 0) null else value;
+}
 
 /// The arguments of `Receiver.modify`. Specification section 3.4.5.
 pub const ModifyOptions = struct {
@@ -375,7 +391,7 @@ pub const Receiver = struct {
             .detach_timeout = options.link.detach_timeout,
             .prefetch = options.prefetch,
             .auto_accept = options.auto_accept,
-            .max_message_size = options.max_message_size,
+            .max_message_size = foldSizeLimit(options.max_message_size),
             .delivery_slots = slots,
             .deliveries = .init(slots),
             .receive_mutex = .init,
@@ -601,9 +617,13 @@ pub const Receiver = struct {
     /// `arrived` between this look and the wait that follows it.
     fn take(self: *Receiver) ?Delivery {
         var buf: [1]Delivery = undefined;
-        // A minimum of zero never blocks, so the call reaches no cancellation
-        // point and it returns `error.Closed` only after `deinit`.
-        const count = self.deliveries.get(self.io, &buf, 0) catch return null;
+        // A minimum of zero never blocks, but `get` still takes the queue mutex
+        // with the cancelable lock, so it can return `error.Canceled`. A cancel
+        // that stopped here would vanish, because the signal fires one time,
+        // and the wait that follows would then park with no pending cancel.
+        // The uncancelable call has no such point, and it returns
+        // `error.Closed` only after `deinit`.
+        const count = self.deliveries.getUncancelable(self.io, &buf, 0) catch return null;
         if (count == 0) return null;
         return buf[0];
     }
@@ -688,6 +708,13 @@ pub const Receiver = struct {
         state: performatives.DeliveryState,
     ) DispositionError!void {
         if (delivery.settled) return;
+
+        // The router task already settled every delivery when `auto_accept` is
+        // on. A second disposition for the same id reports a settled delivery
+        // again, and section 2.7.6 gives the receiver no reason to send it. A
+        // caller that wants to choose the outcome turns `auto_accept` off.
+        if (self.auto_accept) return;
+
         return self.sendDisposition(delivery.delivery_id, state);
     }
 
@@ -781,7 +808,7 @@ pub const Receiver = struct {
             // Section 2.7.5: "The delivery-id MUST be supplied on the first
             // transfer of a multi-transfer delivery."
             const id = performative.delivery_id orelse {
-                self.link.fail(
+                self.link.failAndDetach(
                     error.LinkRemoteError,
                     session_mod.condition.not_allowed,
                     "a transfer frame started a delivery without a delivery id",
@@ -809,7 +836,7 @@ pub const Receiver = struct {
             // transfer of a delivery."
             if (performative.delivery_id) |id| {
                 if (id != self.assembly.delivery_id) {
-                    self.link.fail(
+                    self.link.failAndDetach(
                         error.LinkRemoteError,
                         session_mod.condition.not_allowed,
                         "a continuation transfer frame named another delivery id",
@@ -846,7 +873,7 @@ pub const Receiver = struct {
                 // Section 2.7.3: a delivery larger than the max-message-size of
                 // the endpoint "results in a message-size-exceeded link-error".
                 self.assembly.dropped = true;
-                self.link.fail(
+                self.link.failAndDetach(
                     error.LinkRemoteError,
                     condition.message_size_exceeded,
                     "a delivery passed the maximum message size of this endpoint",
@@ -2122,4 +2149,236 @@ test "a delivery past the maximum message size ends the link" {
     defer frames.deinit();
     const attach = frames.find(.attach).?.body.?.attach;
     try testing.expectEqual(@as(?u64, 8), attach.max_message_size);
+
+    // Section 2.6.5: "When an error occurs at a link endpoint, the endpoint
+    // MUST be detached with appropriate error information supplied in the
+    // error field of the detach frame." An endpoint that only went silent
+    // would leave the link attached at the remote peer with no reason.
+    const detach = frames.find(.detach).?.body.?.detach;
+    try testing.expectEqual(@as(?bool, true), detach.closed);
+    try testing.expectEqualStrings(
+        condition.message_size_exceeded,
+        detach.error_condition.?.condition.?.text,
+    );
+}
+
+test "an accept after auto-accept writes no second disposition" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    const encoded = try encodeMessage(gpa, "the body");
+    defer gpa.free(encoded);
+
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink, null);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
+    const attach_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteAttach(.{}), "");
+    try appendFrame(&sink, 0, remoteTransfer(.{
+        .delivery_id = 0,
+        .delivery_tag = "a-tag",
+    }), encoded);
+
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = attach_at, .after_frames = 3 },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.start(gpa, io, sink.written(), &gates);
+    defer fixture.deinit();
+
+    // `auto_accept` is on by default, so the router task settled the delivery
+    // before the caller saw it.
+    const rcv = try Receiver.attach(fixture.session, .{
+        .link = .{ .name = "link-one", .address = "the-node" },
+        .prefetch = 4,
+    });
+    defer rcv.deinit();
+
+    const delivery = (try rcv.receive(.{
+        .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+    })).?;
+    defer delivery.deinit();
+
+    // The delivery arrived unsettled, so the settled guard alone lets this
+    // call through. A second disposition would report a delivery that this
+    // endpoint already settled.
+    try rcv.accept(delivery);
+
+    var frames: SentFrames = try .parse(gpa, fixture.peer.sent());
+    defer frames.deinit();
+    try testing.expectEqual(@as(usize, 1), frames.count(.disposition));
+}
+
+test "a first transfer without a delivery id ends the link" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    const encoded = try encodeMessage(gpa, "the body");
+    defer gpa.free(encoded);
+
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink, null);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
+    const attach_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteAttach(.{}), "");
+    // Section 2.7.5: "The delivery-id MUST be supplied on the first transfer
+    // of a multi-transfer delivery."
+    try appendFrame(&sink, 0, remoteTransfer(.{ .delivery_tag = "a-tag" }), encoded);
+
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = attach_at, .after_frames = 3 },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.start(gpa, io, sink.written(), &gates);
+    defer fixture.deinit();
+
+    const rcv = try Receiver.attach(fixture.session, .{
+        .link = .{ .name = "link-one", .address = "the-node" },
+        .prefetch = 4,
+    });
+    defer rcv.deinit();
+
+    try testing.expectError(error.LinkRemoteError, rcv.receive(.{
+        .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+    }));
+    try testing.expectEqualStrings(
+        session_mod.condition.not_allowed,
+        rcv.failure().?.condition.?,
+    );
+
+    // Section 2.6.5 asks for the reason on the wire, and not for silence.
+    var frames: SentFrames = try .parse(gpa, fixture.peer.sent());
+    defer frames.deinit();
+    const detach = frames.find(.detach).?.body.?.detach;
+    try testing.expectEqualStrings(
+        session_mod.condition.not_allowed,
+        detach.error_condition.?.condition.?.text,
+    );
+}
+
+test "a continuation transfer that names another delivery id ends the link" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    const encoded = try encodeMessage(gpa, "the first half");
+    defer gpa.free(encoded);
+
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink, null);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
+    const attach_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteAttach(.{}), "");
+    const transfer_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteTransfer(.{
+        .delivery_id = 3,
+        .delivery_tag = "a-tag",
+        .more = true,
+    }), encoded);
+    // Section 2.7.5: "It is an error if the delivery-id on a continuation
+    // transfer differs from the delivery-id on the first transfer of a
+    // delivery."
+    try appendFrame(&sink, 0, remoteTransfer(.{ .delivery_id = 4 }), "the rest");
+
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = attach_at, .after_frames = 3 },
+        .{ .at = transfer_at, .after_frames = 4 },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.start(gpa, io, sink.written(), &gates);
+    defer fixture.deinit();
+
+    const rcv = try Receiver.attach(fixture.session, .{
+        .link = .{ .name = "link-one", .address = "the-node" },
+        .prefetch = 4,
+    });
+    defer rcv.deinit();
+
+    try testing.expectError(error.LinkRemoteError, rcv.receive(.{
+        .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+    }));
+    try testing.expectEqualStrings(
+        session_mod.condition.not_allowed,
+        rcv.failure().?.condition.?,
+    );
+
+    var frames: SentFrames = try .parse(gpa, fixture.peer.sent());
+    defer frames.deinit();
+    const detach = frames.find(.detach).?.body.?.detach;
+    try testing.expectEqualStrings(
+        session_mod.condition.not_allowed,
+        detach.error_condition.?.condition.?.text,
+    );
+}
+
+test "a resumed delivery reaches no caller" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    const encoded = try encodeMessage(gpa, "the body");
+    defer gpa.free(encoded);
+
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink, null);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
+    const attach_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteAttach(.{}), "");
+    // This endpoint sends no unsettled map on its attach frame, so its map is
+    // empty and it knows no delivery to resume.
+    try appendFrame(&sink, 0, remoteTransfer(.{
+        .delivery_id = 0,
+        .delivery_tag = "a-tag",
+        .resumed = true,
+    }), encoded);
+
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = attach_at, .after_frames = 3 },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.start(gpa, io, sink.written(), &gates);
+    defer fixture.deinit();
+
+    const rcv = try Receiver.attach(fixture.session, .{
+        .link = .{ .name = "link-one", .address = "the-node" },
+        .prefetch = 4,
+    });
+    defer rcv.deinit();
+
+    const delivery = try rcv.receive(.{
+        .duration = .{ .raw = .fromMilliseconds(60), .clock = .awake },
+    });
+    try testing.expect(delivery == null);
+    try testing.expect(rcv.failure() == null);
+
+    var frames: SentFrames = try .parse(gpa, fixture.peer.sent());
+    defer frames.deinit();
+    try testing.expectEqual(@as(usize, 0), frames.count(.disposition));
+}
+
+test "a maximum message size of zero sets no limit" {
+    // Section 2.7.3: "If this field is zero or unset, there is no maximum size
+    // imposed". A zero that meant a limit of zero would kill the link on the
+    // first octet of the first delivery.
+    try testing.expectEqual(@as(?u64, null), foldSizeLimit(0));
+    try testing.expectEqual(@as(?u64, null), foldSizeLimit(null));
+    try testing.expectEqual(@as(?u64, 1024), foldSizeLimit(1024));
 }
