@@ -95,6 +95,11 @@ pub const Error = error{
     /// The session under the link ended. Read `Session.failure` for the
     /// reason.
     LinkSessionFailed,
+    /// The remote peer refused the link. Section 2.6.3: a peer that will not
+    /// create a terminus answers with a null local terminus and then detaches.
+    /// The local terminus of the remote peer is the `target` for a receiving
+    /// endpoint and the `source` for a sending one.
+    LinkRefused,
     /// A write failed part way through a delivery, and the abort of that
     /// delivery failed too. The remote peer holds an open delivery that no
     /// frame can close. The link refuses every later send, because section
@@ -550,8 +555,32 @@ pub const Link = struct {
     /// carries depend on the role. The caller owns every slice of
     /// `performative`, and the slices must live until this call returns.
     pub fn sendAttach(self: *Link, performative: performatives.Attach) SendError!void {
+        return self.sendFrame(.{ .attach = performative });
+    }
+
+    /// Sends one frame of this link on the session under it.
+    ///
+    /// Use it for a frame that carries no window of section 2.5.6, such as a
+    /// `disposition`. The call ends the link when the session refuses the
+    /// frame, so that no task waits for an answer that cannot arrive.
+    ///
+    /// The caller owns every slice of `body`, and the slices must live until
+    /// this call returns.
+    pub fn sendFrame(self: *Link, body: framing.Body) SendError!void {
         if (self.failure()) |f| return f.err;
-        self.session.send(.{ .attach = performative }, "") catch |err| {
+        self.session.send(body, "") catch |err| {
+            self.noteSessionError(err);
+            return err;
+        };
+    }
+
+    /// Sends one flow frame that carries the state of this link.
+    ///
+    /// Section 2.7.4 puts the session state on every flow frame, so the send
+    /// goes through the session and the session fills those four fields in.
+    pub fn sendFlow(self: *Link, state: session_mod.LinkFlow) SendError!void {
+        if (self.failure()) |f| return f.err;
+        self.session.sendFlow(state) catch |err| {
             self.noteSessionError(err);
             return err;
         };
