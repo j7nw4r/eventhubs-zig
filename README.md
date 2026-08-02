@@ -16,7 +16,11 @@ primitive types through `amqp.Value`, `amqp.encode`, and `amqp.decode`. It also
 encodes and decodes the performatives, the delivery states, and the message
 sections through `amqp.performatives` and `amqp.message`. It reads and writes
 AMQP and SASL frames, and it exchanges the protocol headers, through
-`amqp.framing`. The client API does not exist yet. Do not use this package in
+`amqp.framing`. It connects over TCP or TLS, and it runs the SASL dialog,
+through `amqp.Transport`. It runs the open handshake, the begin handshake, and
+the attach handshake through `amqp.Connection`, `amqp.Session`, and
+`amqp.Sender`, and `amqp.Sender.send` puts one message on the wire and reports
+the outcome. The receiver link does not exist yet. Do not use this package in
 production until version 1.0.0.
 
 Track the work in [issue #1](https://github.com/j7nw4r/eventhubs-zig/issues/1).
