@@ -779,8 +779,18 @@ pub const Sender = struct {
             // A drain answer is best effort. The session reports its own
             // failure to every caller of `send`, so a lost answer here needs
             // no second report.
+            //
+            // A cancel is the one error that this call must not drop. The
+            // signal fires one time, so a `error.Canceled` that stops here
+            // leaves the router with no pending signal, and the router then
+            // parks in `getOne` forever. `Link.detach` cancels the group and
+            // waits for the task, so it would never return. `recancel` arms
+            // the request again, and the next wait then ends the router.
             .flow => |performative| if (self.receiveFlow(performative)) |answer| {
-                self.link.session.sendFlow(answer) catch {};
+                self.link.session.sendFlow(answer) catch |err| switch (err) {
+                    error.Canceled => self.io.recancel(),
+                    else => {},
+                };
             },
             .disposition => |performative| self.receiveDisposition(performative),
             else => {},
@@ -830,8 +840,12 @@ pub const Sender = struct {
         // The formula uses RFC 1982 serial arithmetic, so a limit behind the
         // delivery count gives no credit and not a very large one.
         self.link_credit = if (room >= serial_negative) 0 else room;
-        if (performative.available) |value| self.available = value;
-        if (performative.drain) |value| self.drain = value;
+
+        // Section 2.7.4 gives the drain field the default false, so a flow
+        // that leaves it out means false and not "keep the last value". A
+        // value that latched would make every later grant drain itself, and
+        // the link would never send again.
+        self.drain = performative.drain orelse false;
 
         if (self.link_credit > 0) self.credit_ready.broadcast(self.io);
 
@@ -1630,7 +1644,10 @@ test "the credit formula of section 2.6.7 takes the delivery count of the receiv
     try testing.expectEqual(@as(u32, 0), snd.link_credit);
     try testing.expectEqual(@as(u32, 6), snd.delivery_count);
     try testing.expect(snd.drain);
-    try testing.expectEqual(@as(u32, 5), snd.available);
+    // Section 2.6.7 lets only the sender set `available`, and the receiver
+    // merely echoes the last value that it saw. This module holds no queue, so
+    // the value stays at zero.
+    try testing.expectEqual(@as(u32, 0), snd.available);
 
     try testing.expect(answer != null);
     try testing.expectEqual(@as(?u32, 6), answer.?.delivery_count);
@@ -2703,4 +2720,36 @@ test "a split delivery that the remote window stops ends the link" {
     try testing.expect(reason != null);
     try testing.expectEqual(link_mod.Error.LinkPartialDelivery, reason.?.err);
     try testing.expectError(error.LinkPartialDelivery, snd.send("later", .{}));
+}
+
+test "a credit grant after a drain restores the credit" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var snd: Sender = undefined;
+    snd.io = io;
+    snd.gpa = gpa;
+    snd.credit_mutex = .init;
+    snd.credit_ready = .init;
+    snd.link = .empty;
+    snd.initial_delivery_count = 0;
+    snd.delivery_count = 0;
+    snd.link_credit = 0;
+    snd.available = 0;
+    snd.drain = false;
+
+    // A drain takes the credit that it granted, and it asks for an answer.
+    const drained = snd.receiveFlow(.{ .delivery_count = 0, .link_credit = 2, .drain = true });
+    try testing.expect(drained != null);
+    try testing.expectEqual(@as(u32, 0), snd.link_credit);
+    try testing.expectEqual(@as(u32, 2), snd.delivery_count);
+
+    // Section 2.7.4 gives the drain field the default false, so this grant
+    // carries no drain. A drain value that latched would take this credit too,
+    // and the link would never send again.
+    const granted = snd.receiveFlow(.{ .delivery_count = 2, .link_credit = 5 });
+    try testing.expect(granted == null);
+    try testing.expect(!snd.drain);
+    try testing.expectEqual(@as(u32, 5), snd.link_credit);
+    try testing.expectEqual(@as(u32, 2), snd.delivery_count);
 }

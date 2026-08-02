@@ -855,3 +855,31 @@ test "the maximum message size folds a zero into no limit" {
     link.remote.max_message_size = 1024;
     try testing.expectEqual(@as(?u64, 1024), link.maxMessageSize());
 }
+
+test "an attach answer that names our own role fails the handshake" {
+    const gpa = testing.allocator;
+    var link: Link = .empty;
+    link.gpa = gpa;
+    link.io = testing.io;
+    link.role = .sender;
+
+    // Section 2.6.1 gives a link one sender endpoint and one receiver
+    // endpoint, so an answer that names our own role is not a link that this
+    // endpoint can use.
+    link.receiveAttach(.{ .name = "the-link", .handle = 3, .role = .sender });
+
+    // The waiter must wake, and it must read the failure. A guard that only
+    // returned early would leave every caller of `attach` waiting.
+    try testing.expect(link.attached.isSet());
+    try testing.expect(!link.isAttached());
+    try testing.expectError(error.LinkRemoteError, link.awaitAttached(.none));
+
+    const reason = link.failure().?;
+    try testing.expectEqual(Error.LinkRemoteError, reason.err);
+    try testing.expectEqualStrings("amqp:not-allowed", reason.condition.?);
+
+    // `deinit` skips a link that no session registered, so free the two
+    // strings here.
+    if (link.failure_condition) |text| gpa.free(text);
+    if (link.failure_description) |text| gpa.free(text);
+}
