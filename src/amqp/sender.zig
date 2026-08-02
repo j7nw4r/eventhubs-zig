@@ -354,6 +354,10 @@ pub const Sender = struct {
     /// an orderly close.
     ///
     /// Call it before `Session.deinit`.
+    ///
+    /// No other call on this sender may run at the same time. A `send`, an
+    /// `attach`, or a `detach` that is still in flight reads memory that this
+    /// call frees. Let every such call return first.
     pub fn deinit(self: *Sender) void {
         const gpa = self.gpa;
         self.link.deinit();
@@ -555,7 +559,20 @@ pub const Sender = struct {
                 // in the SENDING state of figure 2.58. Section 2.6.14 lets the
                 // sender abort the delivery, and the receiver then discards
                 // every octet that arrived.
-                self.abort() catch {};
+                //
+                // An abort that fails leaves that delivery open at the remote
+                // peer, and no later frame can close it. A second delivery
+                // would then start inside the open one, which section 2.6.14
+                // forbids, and its delivery id would land on a continuation
+                // frame, which section 2.7.5 names an error. The link
+                // therefore ends here, so that no later send interleaves.
+                self.abort() catch {
+                    self.link.fail(
+                        error.LinkPartialDelivery,
+                        session_mod.condition.internal_error,
+                        "a delivery stopped part way and the abort failed",
+                    );
+                };
                 return err;
             };
             offset += take;
@@ -610,14 +627,23 @@ pub const Sender = struct {
         const overhead: usize = framing.frame_header_size;
 
         const later: performatives.Transfer = .{ .handle = self.link.handle };
-        var head_more = head;
+
+        // `Session.sendFirstTransfer` stamps the delivery id after this call,
+        // so `head` still carries a null there. A null encodes as one octet,
+        // and a real id encodes as two octets up to 255 and five octets above
+        // it. Sizing against the null therefore builds a first frame that
+        // passes the negotiated limit for every delivery after the first one
+        // of the session. Size against the largest id instead.
+        var head_sized = head;
+        head_sized.delivery_id = std.math.maxInt(u32);
+        var head_more = head_sized;
         head_more.more = true;
         var later_more = later;
         later_more.more = true;
 
         const sizes = [_]usize{
             overhead + try head_more.encodedSize(),
-            overhead + try head.encodedSize(),
+            overhead + try head_sized.encodedSize(),
             overhead + try later_more.encodedSize(),
             overhead + try later.encodedSize(),
         };
@@ -750,7 +776,12 @@ pub const Sender = struct {
 
         const body = frame.body orelse return;
         switch (body) {
-            .flow => |performative| self.receiveFlow(performative),
+            // A drain answer is best effort. The session reports its own
+            // failure to every caller of `send`, so a lost answer here needs
+            // no second report.
+            .flow => |performative| if (self.receiveFlow(performative)) |answer| {
+                self.link.session.sendFlow(answer) catch {};
+            },
             .disposition => |performative| self.receiveDisposition(performative),
             else => {},
         }
@@ -779,7 +810,11 @@ pub const Sender = struct {
     /// delivery-count(snd)`. A receiver that does not know the delivery count
     /// leaves the field out, and the sender then reads it as the delivery
     /// count of its own attach frame.
-    fn receiveFlow(self: *Sender, performative: performatives.Flow) void {
+    ///
+    /// The call returns the flow state to send when the receiver asks for a
+    /// drain, and null in every other case. The caller sends it after the
+    /// credit lock is free, because the send takes the lock of the session.
+    fn receiveFlow(self: *Sender, performative: performatives.Flow) ?session_mod.LinkFlow {
         self.credit_mutex.lockUncancelable(self.io);
         defer self.credit_mutex.unlock(self.io);
 
@@ -799,6 +834,36 @@ pub const Sender = struct {
         if (performative.drain) |value| self.drain = value;
 
         if (self.link_credit > 0) self.credit_ready.broadcast(self.io);
+
+        // Section 2.6.7: "If the sender's drain flag is set and there are no
+        // available messages, the sender MUST advance its delivery-count until
+        // link-credit is zero, and send its updated flow state to the
+        // receiver." This sender holds no queue, so it has no available
+        // message at this moment. A receiver that runs a timed get waits for
+        // this answer, and it waits forever without it.
+        if (self.drain and self.link_credit > 0) {
+            self.delivery_count +%= self.link_credit;
+            self.link_credit = 0;
+            return self.linkFlowLocked();
+        }
+
+        // Section 2.7.4: "If set to true then the receiver SHOULD send its
+        // state at the earliest convenient opportunity." A flow that names
+        // this handle asks for the state of this link, and the session hands
+        // that frame here.
+        if (performative.echo orelse false) return self.linkFlowLocked();
+        return null;
+    }
+
+    /// Returns the flow state of this link. The caller holds `credit_mutex`.
+    fn linkFlowLocked(self: *Sender) session_mod.LinkFlow {
+        return .{
+            .handle = self.link.handle,
+            .delivery_count = self.delivery_count,
+            .link_credit = self.link_credit,
+            .available = self.available,
+            .drain = self.drain,
+        };
     }
 
     /// Gives the outcome of a disposition frame to every delivery that it
@@ -1535,26 +1600,42 @@ test "the credit formula of section 2.6.7 takes the delivery count of the receiv
 
     // link-credit(snd) := delivery-count(rcv) + link-credit(rcv) -
     // delivery-count(snd).
-    snd.receiveFlow(.{ .delivery_count = 4, .link_credit = 10 });
+    _ = snd.receiveFlow(.{ .delivery_count = 4, .link_credit = 10 });
     try testing.expectEqual(@as(u32, 10), snd.link_credit);
 
-    snd.receiveFlow(.{ .delivery_count = 2, .link_credit = 10 });
+    _ = snd.receiveFlow(.{ .delivery_count = 2, .link_credit = 10 });
     try testing.expectEqual(@as(u32, 8), snd.link_credit);
 
     // A limit behind the delivery count gives no credit, because the section
     // uses RFC 1982 serial arithmetic.
-    snd.receiveFlow(.{ .delivery_count = 2, .link_credit = 1 });
+    _ = snd.receiveFlow(.{ .delivery_count = 2, .link_credit = 1 });
     try testing.expectEqual(@as(u32, 0), snd.link_credit);
 
     // A flow without a delivery count falls back to the value of the attach
     // frame of this endpoint.
-    snd.receiveFlow(.{ .link_credit = 7 });
+    _ = snd.receiveFlow(.{ .link_credit = 7 });
     try testing.expectEqual(@as(u32, 3), snd.link_credit);
 
-    snd.receiveFlow(.{ .delivery_count = 4, .link_credit = 2, .drain = true, .available = 5 });
-    try testing.expectEqual(@as(u32, 2), snd.link_credit);
+    // Section 2.6.7: "If the sender's drain flag is set and there are no
+    // available messages, the sender MUST advance its delivery-count until
+    // link-credit is zero, and send its updated flow state to the receiver."
+    // The formula gives this flow a credit of 2, and the drain then takes that
+    // credit onto the delivery count and asks for a flow frame in answer.
+    const answer = snd.receiveFlow(.{
+        .delivery_count = 4,
+        .link_credit = 2,
+        .drain = true,
+        .available = 5,
+    });
+    try testing.expectEqual(@as(u32, 0), snd.link_credit);
+    try testing.expectEqual(@as(u32, 6), snd.delivery_count);
     try testing.expect(snd.drain);
     try testing.expectEqual(@as(u32, 5), snd.available);
+
+    try testing.expect(answer != null);
+    try testing.expectEqual(@as(?u32, 6), answer.?.delivery_count);
+    try testing.expectEqual(@as(?u32, 0), answer.?.link_credit);
+    try testing.expectEqual(@as(?bool, true), answer.?.drain);
 }
 
 test "the credit formula wraps with serial arithmetic" {
@@ -1576,7 +1657,7 @@ test "the credit formula wraps with serial arithmetic" {
 
     // The receiver still sits two deliveries before the wrap, and it grants 5,
     // so the limit is three past the wrap and two past this endpoint.
-    snd.receiveFlow(.{ .delivery_count = std.math.maxInt(u32) - 1, .link_credit = 5 });
+    _ = snd.receiveFlow(.{ .delivery_count = std.math.maxInt(u32) - 1, .link_credit = 5 });
     try testing.expectEqual(@as(u32, 2), snd.link_credit);
 }
 
@@ -1652,7 +1733,9 @@ test "a payload larger than the frame size splits into a sequence of transfers" 
     try testing.expectEqual(@as(?u32, 0), first.message_format);
     try testing.expectEqual(@as(?bool, false), first.settled);
     try testing.expectEqual(@as(?bool, true), first.more);
-    try testing.expectEqual(@as(usize, 483), sent.items[0].payload.len);
+    // The first frame reserves room for the largest delivery id, because the
+    // session stamps the id after the budget is computed.
+    try testing.expectEqual(@as(usize, 479), sent.items[0].payload.len);
 
     // Frame 2. Section 2.7.5 lets a continuation transfer omit all three.
     const middle = sent.items[1].frame.body.?.transfer;
@@ -1668,7 +1751,7 @@ test "a payload larger than the frame size splits into a sequence of transfers" 
     try testing.expectEqual(@as(?u32, 0), last.handle);
     try testing.expectEqual(@as(?u32, null), last.delivery_id);
     try testing.expectEqual(@as(?bool, null), last.more);
-    try testing.expectEqual(@as(usize, 225), sent.items[2].payload.len);
+    try testing.expectEqual(@as(usize, 229), sent.items[2].payload.len);
 
     // Every frame fits the negotiated maximum frame size, and the three
     // payloads rebuild the message.
@@ -1691,8 +1774,10 @@ test "a payload that fits stays in one transfer frame" {
     var storage: session_mod.Storage = try .init(gpa, 8);
     defer storage.deinit(gpa);
 
-    // 484 octets is the largest payload of a single frame of 512 octets.
-    var payload: [484]u8 = undefined;
+    // 480 octets is the largest payload of a single frame of 512 octets. The
+    // frame reserves room for the largest delivery id, because the session
+    // stamps the id after the budget is computed.
+    var payload: [480]u8 = undefined;
     for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
 
     var sink: Writer.Allocating = .init(gpa);
@@ -2490,4 +2575,132 @@ test "a session that ends under the attach handshake ends the wait" {
         .address = "the-node",
         .attach_timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
     } }));
+}
+test "a split delivery with a delivery id above zero still fits the frame size" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: session_mod.Storage = try .init(gpa, 8);
+    defer storage.deinit(gpa);
+
+    var payload: [1200]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink, 512);
+    const begin_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteBegin(0), "");
+    const attach_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteAttach("link-one", 7, null), "");
+    try appendFrame(&sink, 0, remoteFlow(7, 2, 0), "");
+    const first_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteDisposition(0, .{ .accepted = .{} }), "");
+    const second_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteDisposition(1, .{ .accepted = .{} }), "");
+
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = attach_at, .after_frames = 3 },
+        .{ .at = first_at, .after_frames = 4 },
+        // The split delivery takes three frames, so its disposition follows
+        // frame 7.
+        .{ .at = second_at, .after_frames = 7 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 8 });
+    defer session.deinit();
+
+    const snd = try Sender.attach(session, .{ .link = .{
+        .name = "link-one",
+        .address = "the-node",
+    } });
+    defer snd.deinit();
+
+    const first = try snd.send("one", .{});
+    defer first.deinit();
+    try testing.expectEqual(@as(u32, 0), first.delivery_id);
+
+    // The second delivery takes the delivery id 1, which encodes as two
+    // octets where a null takes one. The budget must leave room for it.
+    const second = try snd.send(&payload, .{});
+    defer second.deinit();
+    try testing.expectEqual(@as(u32, 1), second.delivery_id);
+    try testing.expect(second.outcome == .accepted);
+}
+
+test "a split delivery that the remote window stops ends the link" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var watchdog = startWatchdog(io);
+    defer stopWatchdog(io, &watchdog);
+
+    var storage: session_mod.Storage = try .init(gpa, 8);
+    defer storage.deinit(gpa);
+
+    var payload: [1200]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try scriptOpen(&sink, 512);
+    const begin_at = sink.written().len;
+    // The remote peer opens an incoming window of two frames, and the delivery
+    // takes three. The third transfer therefore stops, and the abort of
+    // section 2.6.14 stops for the same reason.
+    try appendFrame(&sink, 0, .{ .begin = .{
+        .remote_channel = 0,
+        .next_outgoing_id = 0,
+        .incoming_window = 2,
+        .outgoing_window = 200,
+    } }, "");
+    const attach_at = sink.written().len;
+    try appendFrame(&sink, 0, remoteAttach("link-one", 7, null), "");
+    try appendFrame(&sink, 0, .{ .flow = .{
+        .next_incoming_id = 0,
+        .incoming_window = 2,
+        .next_outgoing_id = 0,
+        .outgoing_window = 200,
+        .handle = 7,
+        .delivery_count = 0,
+        .link_credit = 5,
+    } }, "");
+
+    var gates = [_]Gate{
+        .{ .at = begin_at, .after_frames = 2 },
+        .{ .at = attach_at, .after_frames = 3 },
+    };
+    var peer: Peer = .init(gpa, io, sink.written(), &gates);
+    defer peer.deinit();
+    const stream = peer.ready();
+
+    const connection = try Connection.open(gpa, io, stream, .{});
+    defer connection.deinit();
+
+    const session = try Session.begin(connection, &storage, .{ .incoming_window = 8 });
+    defer session.deinit();
+
+    const snd = try Sender.attach(session, .{ .link = .{
+        .name = "link-one",
+        .address = "the-node",
+    } });
+    defer snd.deinit();
+
+    try testing.expectError(error.RemoteWindowClosed, snd.send(&payload, .{}));
+
+    // The remote peer holds an open delivery that no frame can close, so the
+    // link refuses every later send. A link that stayed usable would start a
+    // second delivery inside the open one.
+    const reason = snd.link.failure();
+    try testing.expect(reason != null);
+    try testing.expectEqual(link_mod.Error.LinkPartialDelivery, reason.?.err);
+    try testing.expectError(error.LinkPartialDelivery, snd.send("later", .{}));
 }

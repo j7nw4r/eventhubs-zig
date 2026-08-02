@@ -95,6 +95,12 @@ pub const Error = error{
     /// The session under the link ended. Read `Session.failure` for the
     /// reason.
     LinkSessionFailed,
+    /// A write failed part way through a delivery, and the abort of that
+    /// delivery failed too. The remote peer holds an open delivery that no
+    /// frame can close. The link refuses every later send, because section
+    /// 2.6.14 forbids a new delivery inside an open one, and a new delivery id
+    /// on a continuation frame is an error under section 2.7.5.
+    LinkPartialDelivery,
 };
 
 /// The reason that a link ended, with the text that came with it.
@@ -713,6 +719,21 @@ pub const Link = struct {
     /// The session routes an incoming attach by the link name of section
     /// 2.6.1, so this frame belongs to this link.
     fn receiveAttach(self: *Link, performative: performatives.Attach) void {
+        // Section 2.6.1 gives a link one sender endpoint and one receiver
+        // endpoint, so the answer of the remote peer always names the opposite
+        // role. An answer that names our own role is not a link that this
+        // endpoint can use, and the handshake must not report success for it.
+        if (performative.role) |role| {
+            if (role == self.role) {
+                self.fail(
+                    error.LinkRemoteError,
+                    session_mod.condition.not_allowed,
+                    "the attach frame of the remote peer named our own role",
+                );
+                return;
+            }
+        }
+
         self.remote = .{
             .handle = performative.handle,
             .role = performative.role,
