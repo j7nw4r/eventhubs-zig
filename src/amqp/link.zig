@@ -95,6 +95,11 @@ pub const Error = error{
     /// The session under the link ended. Read `Session.failure` for the
     /// reason.
     LinkSessionFailed,
+    /// The remote peer refused the link. Section 2.6.3: a peer that will not
+    /// create a terminus answers with a null local terminus and then detaches.
+    /// The local terminus of the remote peer is the `target` for a receiving
+    /// endpoint and the `source` for a sending one.
+    LinkRefused,
     /// A write failed part way through a delivery, and the abort of that
     /// delivery failed too. The remote peer holds an open delivery that no
     /// frame can close. The link refuses every later send, because section
@@ -550,8 +555,32 @@ pub const Link = struct {
     /// carries depend on the role. The caller owns every slice of
     /// `performative`, and the slices must live until this call returns.
     pub fn sendAttach(self: *Link, performative: performatives.Attach) SendError!void {
+        return self.sendFrame(.{ .attach = performative });
+    }
+
+    /// Sends one frame of this link on the session under it.
+    ///
+    /// Use it for a frame that carries no window of section 2.5.6, such as a
+    /// `disposition`. The call ends the link when the session refuses the
+    /// frame, so that no task waits for an answer that cannot arrive.
+    ///
+    /// The caller owns every slice of `body`, and the slices must live until
+    /// this call returns.
+    pub fn sendFrame(self: *Link, body: framing.Body) SendError!void {
         if (self.failure()) |f| return f.err;
-        self.session.send(.{ .attach = performative }, "") catch |err| {
+        self.session.send(body, "") catch |err| {
+            self.noteSessionError(err);
+            return err;
+        };
+    }
+
+    /// Sends one flow frame that carries the state of this link.
+    ///
+    /// Section 2.7.4 puts the session state on every flow frame, so the send
+    /// goes through the session and the session fills those four fields in.
+    pub fn sendFlow(self: *Link, state: session_mod.LinkFlow) SendError!void {
+        if (self.failure()) |f| return f.err;
+        self.session.sendFlow(state) catch |err| {
             self.noteSessionError(err);
             return err;
         };
@@ -637,6 +666,46 @@ pub const Link = struct {
         const f = self.failure().?;
         if (f.err == error.LinkDetached) return;
         return f.err;
+    }
+
+    /// Ends the link with a reason, and tells the remote peer why.
+    ///
+    /// Section 2.6.5: "When an error occurs at a link endpoint, the endpoint
+    /// MUST be detached with appropriate error information supplied in the
+    /// error field of the detach frame." A link that only failed here would
+    /// leave the remote peer with the link still attached and no reason for
+    /// the silence.
+    ///
+    /// The call sends the frame and does not wait for the answer, so the
+    /// router task can call it on itself. `sendDetach` writes one frame only,
+    /// so a later `detach` adds none. The send is best effort: a session that
+    /// already ended reports the failure to the caller of the link instead.
+    ///
+    /// The caller owns `failure_condition` and `description`, and both must
+    /// live until this call returns.
+    pub fn failAndDetach(
+        self: *Link,
+        err: Error,
+        failure_condition: []const u8,
+        description: ?[]const u8,
+    ) void {
+        self.fail(err, failure_condition, description);
+        self.sendDetach(.{
+            .closed = true,
+            .error_condition = .{
+                .condition = .of(failure_condition),
+                .description = description,
+            },
+        }) catch |send_err| switch (send_err) {
+            // The send takes `state_mutex` of the session and then the write
+            // lock of the connection, and both are cancelation points. A
+            // cancel signal fires one time, so a cancel that stopped here
+            // would vanish and the router task would park in `getOne` on a
+            // queue that only `deinit` closes. `detach` cancels the group and
+            // then waits for that task, so it would wait forever.
+            error.Canceled => self.io.recancel(),
+            else => {},
+        };
     }
 
     /// Writes the detach frame one time.

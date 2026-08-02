@@ -46,6 +46,10 @@ pub const link = @import("link.zig");
 /// of section 2.7.5, and the outcome of a delivery.
 pub const sender = @import("sender.zig");
 
+/// The receiving link endpoint: the credit of section 2.6.7, the reassembly of
+/// the transfer frames of section 2.7.5, and the dispositions of section 2.7.6.
+pub const receiver = @import("receiver.zig");
+
 /// One AMQP 1.0 value. The decoder allocates it, and `Value.deinit` frees it.
 pub const Value = types.Value;
 
@@ -233,6 +237,24 @@ pub const Outcome = sender.Outcome;
 /// The result of one `Sender.send`.
 pub const SendResult = sender.Result;
 
+/// One receiving link endpoint.
+pub const Receiver = receiver.Receiver;
+
+/// The arguments of `Receiver.attach`.
+pub const ReceiverOptions = receiver.Options;
+
+/// The arguments of `Receiver.modify`.
+pub const ModifyOptions = receiver.ModifyOptions;
+
+/// One message that arrived on a receiving link.
+pub const Delivery = receiver.Delivery;
+
+/// One entry of the filter set of a source, with a string value.
+pub const StringFilter = receiver.StringFilter;
+
+/// The error condition symbols that the receiver layer sends.
+pub const receiver_condition = receiver.condition;
+
 /// The version of the AMQP specification that this library speaks.
 pub const protocol_version = "1.0";
 
@@ -252,4 +274,5 @@ test {
     _ = session;
     _ = link;
     _ = sender;
+    _ = receiver;
 }

@@ -20,8 +20,11 @@ AMQP and SASL frames, and it exchanges the protocol headers, through
 through `amqp.Transport`. It runs the open handshake, the begin handshake, and
 the attach handshake through `amqp.Connection`, `amqp.Session`, and
 `amqp.Sender`, and `amqp.Sender.send` puts one message on the wire and reports
-the outcome. The receiver link does not exist yet. Do not use this package in
-production until version 1.0.0.
+the outcome. `amqp.Receiver` attaches a receiving link with caller-supplied
+source filters, grants credit, joins the transfer frames of one delivery into
+one message, and reports the outcome of each unsettled delivery with an accept,
+a release, a reject, or a modify. Do not use this package in production until
+version 1.0.0.
 
 Track the work in [issue #1](https://github.com/j7nw4r/eventhubs-zig/issues/1).
 Read [`docs/design.md`](docs/design.md) for the full design.
